@@ -8,6 +8,9 @@ sql:
     driver: "ODBC Driver 17 for SQL Server"
     auth: "trusted"                 # Windows integrated auth (Trusted_Connection=yes)
     query_start_date: "2025-10-01"  # CONFIRM: matches the existing workbook's cutoff filter
+    # Field Teams not yet ingested into Hubscape - omit entirely from the extract rather than
+    # letting them permanently show up as "missing from Hubscape" false positives downstream.
+    excluded_contractor_ids: [3244, 8030, 8031]
   visits_api_excel:
     # The direct Azure SQL connection (ActiveDirectoryInteractive) needed a fresh interactive
     # Entra sign-in roughly daily, which an unattended overnight run can't complete. Instead,

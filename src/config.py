@@ -64,6 +64,7 @@ class Config:
     ice2: SqlServerConfig
     visits_api_excel: ExcelSourceConfig
     ice2_query_start_date: str
+    ice2_excluded_contractor_ids: list[int]
     visits_api_status_title_column: str
     recent_window_days: int
     legitimately_excluded_from_hubscape: set
@@ -159,6 +160,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         ice2=ice2,
         visits_api_excel=visits_api_excel,
         ice2_query_start_date=ice2_raw.get("query_start_date", "2024-04-01"),
+        ice2_excluded_contractor_ids=list(ice2_raw.get("excluded_contractor_ids", [])),
         visits_api_status_title_column=api_raw.get("status_title_column", "Title"),
         recent_window_days=int(recency_raw.get("recent_window_days", 30)),
         legitimately_excluded_from_hubscape=set(

@@ -19,6 +19,7 @@ def make_cfg() -> Config:
             refresh_timeout_seconds=180,
         ),
         ice2_query_start_date="2024-04-01",
+        ice2_excluded_contractor_ids=[],
         visits_api_status_title_column="Title",
         recent_window_days=30,
         legitimately_excluded_from_hubscape={50, 60, 70},

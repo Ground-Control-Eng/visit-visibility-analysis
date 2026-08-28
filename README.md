@@ -1,8 +1,7 @@
 # Daily Hubscape / Visits API / ICe2 Visit Reconciliation
 
 Automates the daily reconciliation across ICe2 (source of truth), the Visits API (nightly
-mapped copy), and Hubscape (what delivery teams see, active visits only). See
-`instructions.md` for the business background.
+mapped copy), and Hubscape (what delivery teams see, active visits only).
 
 ## Setup (one-time)
 
@@ -46,9 +45,10 @@ All settings live in `config.yaml` - no code changes needed to retune:
   no config needed. A visit whose team couldn't be resolved (no `Om_Job_Labour_Used` match)
   is classified `Unknown`.
 
-**Still to confirm once a real Hubscape email has been seen** (see `config.yaml` comments):
-the exact attachment column name/format, and whether the ICe2 query's
-`ExpectedStartDate >= 2024-04-01` cutoff should stay.
+The attachment column name/format (`External Visit API Id`) has been confirmed against real
+Hubscape exports. The ICe2 query's `ExpectedStartDate` cutoff is controlled by
+`sql.ice2.query_start_date` in `config.yaml` (currently `2025-10-01`) and can be retuned there
+without a code change.
 
 ## Running manually
 

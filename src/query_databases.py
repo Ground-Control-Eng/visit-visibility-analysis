@@ -39,6 +39,11 @@ FROM OM_Visit v
     -- team couldn't be resolved instead of surfacing it as internalcontractor = NULL ("Unknown").
     LEFT JOIN tblContractor ft ON j.ContractorID = ft.intContractorID AND ft.istest = 0
 WHERE v.ExpectedStartDate >= :start_date
+    -- j.ContractorID IS NULL guard for the same reason as the ft.istest fix above: j comes from
+    -- a LEFT JOIN, so a visit with no resolved contractor has j.ContractorID = NULL, and a bare
+    -- `NOT IN` would evaluate that to UNKNOWN (excluded) under three-valued logic - silently
+    -- dropping unresolved-team visits instead of just the specific excluded contractors.
+    AND (j.ContractorID IS NULL OR j.ContractorID NOT IN :excluded_contractor_ids)
 ORDER BY v.VisitID;
 """
 # API_ID is no longer sourced from ICe2's own GCIS_API_Record_Mapping table (which could
@@ -97,11 +102,17 @@ def _run_query(source_name: str, cfg: SqlServerConfig, query: str | sqlalchemy.s
 
 
 def get_ice2_visits(cfg: Config) -> pd.DataFrame:
+    query = sqlalchemy.text(ICE2_QUERY_TEMPLATE).bindparams(
+        sqlalchemy.bindparam("excluded_contractor_ids", expanding=True)
+    )
     return _run_query(
         "ICe2",
         cfg.ice2,
-        ICE2_QUERY_TEMPLATE,
-        params={"start_date": cfg.ice2_query_start_date},
+        query,
+        params={
+            "start_date": cfg.ice2_query_start_date,
+            "excluded_contractor_ids": cfg.ice2_excluded_contractor_ids,
+        },
     )
 
 

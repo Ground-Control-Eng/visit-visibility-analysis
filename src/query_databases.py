@@ -33,9 +33,12 @@ FROM OM_Visit v
         FROM OM_Job j
         INNER JOIN Om_Job_Labour_Used jlu ON j.jobid = jlu.jobid
     ) j ON v.VisitID = j.VisitID AND j.rn = 1
-    LEFT JOIN tblContractor ft ON j.ContractorID = ft.intContractorID
+    -- istest belongs in the JOIN condition, not WHERE: ft is outer-joined, so a visit with no
+    -- resolved contractor at all has ft.istest = NULL, and `WHERE ft.istest = 0` evaluates that
+    -- to UNKNOWN (excluded) under SQL's three-valued logic - silently dropping every visit whose
+    -- team couldn't be resolved instead of surfacing it as internalcontractor = NULL ("Unknown").
+    LEFT JOIN tblContractor ft ON j.ContractorID = ft.intContractorID AND ft.istest = 0
 WHERE v.ExpectedStartDate >= :start_date
-  AND ft.istest = 0
 ORDER BY v.VisitID;
 """
 # API_ID is no longer sourced from ICe2's own GCIS_API_Record_Mapping table (which could

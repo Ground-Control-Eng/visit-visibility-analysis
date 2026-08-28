@@ -216,6 +216,133 @@ def test_orphan_stays_true_orphan_when_status_lookup_does_not_resolve_it():
     assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_STATUS_EXCLUDED", "count"].iloc[0]) == 0
 
 
+def test_orphan_team_excluded_when_contractor_id_matches_excluded_list():
+    # A999 is known to ICe2 (VisitID 999 resolves) but its ContractorID (9001) is one of the
+    # configured excluded_contractor_ids - i.e. it's excluded from the main extract by policy,
+    # despite already being present in Hubscape. This must land in ORPHAN_ICE2_TEAM_EXCLUDED, not
+    # the generic ORPHAN_ICE2_STATUS_EXCLUDED (which would misleadingly imply a status/date lag).
+    ice2 = pd.DataFrame([make_ice2_row("5", 20, "In Progress")])
+    api = pd.DataFrame([
+        {"API_ID": "A1", "VisitID": "5", "Title": "In Progress"},
+        {"API_ID": "A999", "VisitID": "999", "Title": "Completed"},
+    ])
+    hub = pd.DataFrame([hub_row("A1"), hub_row("A999")])
+    cfg = make_cfg()
+    cfg.ice2_excluded_contractor_ids = [9001]
+    lookup = pd.DataFrame([{"VisitID": "999", "VisitStatusID": 60, "ContractorID": 9001, "internalcontractor": 0}])
+
+    summary, detail = reconcile(ice2, api, hub, cfg, orphan_status_lookup=lookup)
+
+    assert "A999" not in set(detail["API_ID"])
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_STATUS_EXCLUDED", "count"].iloc[0]) == 0
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_TEAM_EXCLUDED", "count"].iloc[0]) == 1
+
+
+def test_orphan_team_excluded_when_de_team_and_exclude_de_teams_enabled():
+    # Same scenario, but excluded via the DE-team flag instead of a specific ContractorID.
+    ice2 = pd.DataFrame([make_ice2_row("5", 20, "In Progress")])
+    api = pd.DataFrame([
+        {"API_ID": "A1", "VisitID": "5", "Title": "In Progress"},
+        {"API_ID": "A999", "VisitID": "999", "Title": "Completed"},
+    ])
+    hub = pd.DataFrame([hub_row("A1"), hub_row("A999")])
+    cfg = make_cfg()
+    cfg.ice2_exclude_de_teams = True
+    lookup = pd.DataFrame([{"VisitID": "999", "VisitStatusID": 60, "ContractorID": 42, "internalcontractor": 1}])
+
+    summary, detail = reconcile(ice2, api, hub, cfg, orphan_status_lookup=lookup)
+
+    assert "A999" not in set(detail["API_ID"])
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_STATUS_EXCLUDED", "count"].iloc[0]) == 0
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_TEAM_EXCLUDED", "count"].iloc[0]) == 1
+
+
+def test_orphan_stays_status_excluded_when_resolved_but_not_policy_excluded():
+    # ContractorID/internalcontractor are present but match neither exclusion condition - this
+    # must stay ORPHAN_ICE2_STATUS_EXCLUDED (regression: presence of the new columns alone must
+    # not divert a genuinely status/date-excluded orphan into the new bucket).
+    ice2 = pd.DataFrame([make_ice2_row("5", 20, "In Progress")])
+    api = pd.DataFrame([
+        {"API_ID": "A1", "VisitID": "5", "Title": "In Progress"},
+        {"API_ID": "A999", "VisitID": "999", "Title": "Completed"},
+    ])
+    hub = pd.DataFrame([hub_row("A1"), hub_row("A999")])
+    cfg = make_cfg()
+    cfg.ice2_excluded_contractor_ids = [9001]
+    cfg.ice2_exclude_de_teams = True
+    lookup = pd.DataFrame([{"VisitID": "999", "VisitStatusID": 60, "ContractorID": 42, "internalcontractor": 0}])
+
+    summary, detail = reconcile(ice2, api, hub, cfg, orphan_status_lookup=lookup)
+
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_STATUS_EXCLUDED", "count"].iloc[0]) == 1
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_TEAM_EXCLUDED", "count"].iloc[0]) == 0
+
+
+def test_orphan_team_excluded_when_both_contractor_and_de_conditions_true():
+    # OR logic, not AND: a visit that would trip *both* exclusion conditions at once must still
+    # land in exactly one bucket (ORPHAN_ICE2_TEAM_EXCLUDED), not be double-counted anywhere.
+    ice2 = pd.DataFrame([make_ice2_row("5", 20, "In Progress")])
+    api = pd.DataFrame([
+        {"API_ID": "A1", "VisitID": "5", "Title": "In Progress"},
+        {"API_ID": "A999", "VisitID": "999", "Title": "Completed"},
+    ])
+    hub = pd.DataFrame([hub_row("A1"), hub_row("A999")])
+    cfg = make_cfg()
+    cfg.ice2_excluded_contractor_ids = [9001]
+    cfg.ice2_exclude_de_teams = True
+    lookup = pd.DataFrame([{"VisitID": "999", "VisitStatusID": 60, "ContractorID": 9001, "internalcontractor": 1}])
+
+    summary, detail = reconcile(ice2, api, hub, cfg, orphan_status_lookup=lookup)
+
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_TEAM_EXCLUDED", "count"].iloc[0]) == 1
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_STATUS_EXCLUDED", "count"].iloc[0]) == 0
+    hubscape_side_total = int(summary.loc[summary["metric"].isin([
+        "HUBSCAPE_MATCHED", "HUBSCAPE_MISSING_API_ID",
+        "ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2", "ORPHAN_ICE2_STATUS_EXCLUDED", "ORPHAN_ICE2_TEAM_EXCLUDED",
+    ]), "count"].sum())
+    assert hubscape_side_total == int(summary.loc[summary["metric"] == "TOTAL_HUBSCAPE_ROWS", "count"].iloc[0])
+
+
+def test_orphan_not_team_excluded_when_contractor_id_unresolved():
+    # The lookup resolves the VisitID's status but not its team (ContractorID/internalcontractor
+    # both NaN - e.g. no Om_Job_Labour_Used match) - an unresolved team must never be treated as
+    # "known excluded", the same principle ICE2_QUERY_TEMPLATE's own IS NULL guards apply.
+    ice2 = pd.DataFrame([make_ice2_row("5", 20, "In Progress")])
+    api = pd.DataFrame([
+        {"API_ID": "A1", "VisitID": "5", "Title": "In Progress"},
+        {"API_ID": "A999", "VisitID": "999", "Title": "Completed"},
+    ])
+    hub = pd.DataFrame([hub_row("A1"), hub_row("A999")])
+    cfg = make_cfg()
+    cfg.ice2_excluded_contractor_ids = [9001]
+    cfg.ice2_exclude_de_teams = True
+    lookup = pd.DataFrame([{"VisitID": "999", "VisitStatusID": 60, "ContractorID": None, "internalcontractor": None}])
+
+    summary, detail = reconcile(ice2, api, hub, cfg, orphan_status_lookup=lookup)
+
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_STATUS_EXCLUDED", "count"].iloc[0]) == 1
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_TEAM_EXCLUDED", "count"].iloc[0]) == 0
+
+
+def test_orphan_team_excluded_matches_across_int_float_string_contractor_id_dtypes():
+    # The lookup's ContractorID arrives as a float (as SQL numeric columns often do via pandas),
+    # while cfg.ice2_excluded_contractor_ids is configured as plain ints - must still match via
+    # the same _normalize_id normalization used elsewhere in this file for join-key comparisons.
+    ice2 = pd.DataFrame([make_ice2_row("5", 20, "In Progress")])
+    api = pd.DataFrame([
+        {"API_ID": "A1", "VisitID": "5", "Title": "In Progress"},
+        {"API_ID": "A999", "VisitID": "999", "Title": "Completed"},
+    ])
+    hub = pd.DataFrame([hub_row("A1"), hub_row("A999")])
+    cfg = make_cfg()
+    cfg.ice2_excluded_contractor_ids = [9001]
+    lookup = pd.DataFrame([{"VisitID": "999", "VisitStatusID": 60, "ContractorID": 9001.0, "internalcontractor": 0}])
+
+    summary, detail = reconcile(ice2, api, hub, cfg, orphan_status_lookup=lookup)
+
+    assert int(summary.loc[summary["metric"] == "ORPHAN_ICE2_TEAM_EXCLUDED", "count"].iloc[0]) == 1
+
+
 def test_classify_team_type_distinguishes_de_subcontractor_and_unknown():
     cfg = make_cfg()
     flags = pd.Series([1, 1, 0, 0, None])
@@ -353,16 +480,22 @@ def test_reconciliation_accounting_covers_every_bucket_and_balances():
         {"API_ID": "A_legit_absent", "VisitID": "legit_absent", "Title": "Completed"},
         {"API_ID": "A_matched", "VisitID": "matched", "Title": "In Progress"},
         {"API_ID": "A_orphan_status_excluded", "VisitID": "orphan_status_excluded", "Title": "Completed"},
+        {"API_ID": "A_orphan_team_excluded", "VisitID": "orphan_team_excluded", "Title": "Completed"},
     ])
 
     hub = pd.DataFrame([
         {"API_ID": "A_matched"},
         {"API_ID": "A_orphan"},  # unknown to ICe2 at all -> ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2
         {"API_ID": "A_orphan_status_excluded"},  # known to ICe2, excluded by status -> ORPHAN_ICE2_STATUS_EXCLUDED
+        {"API_ID": "A_orphan_team_excluded"},  # known to ICe2, excluded contractor -> ORPHAN_ICE2_TEAM_EXCLUDED
         {"API_ID": None},  # -> HUBSCAPE_MISSING_API_ID
     ])
-    orphan_status_lookup = pd.DataFrame([{"VisitID": "orphan_status_excluded", "VisitStatusID": 60}])
+    orphan_status_lookup = pd.DataFrame([
+        {"VisitID": "orphan_status_excluded", "VisitStatusID": 60, "ContractorID": 1, "internalcontractor": 0},
+        {"VisitID": "orphan_team_excluded", "VisitStatusID": 60, "ContractorID": 9001, "internalcontractor": 0},
+    ])
     cfg = make_cfg()
+    cfg.ice2_excluded_contractor_ids = [9001]
 
     summary, _ = reconcile(
         ice2, api, hub, cfg, reference_date=date(2026, 1, 10), orphan_status_lookup=orphan_status_lookup,
@@ -375,8 +508,10 @@ def test_reconciliation_accounting_covers_every_bucket_and_balances():
     ])
     hubscape_side_total = sum(counts[m] for m in [
         "HUBSCAPE_MATCHED", "HUBSCAPE_MISSING_API_ID",
-        "ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2", "ORPHAN_ICE2_STATUS_EXCLUDED",
+        "ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2", "ORPHAN_ICE2_STATUS_EXCLUDED", "ORPHAN_ICE2_TEAM_EXCLUDED",
     ])
 
+    assert counts["ORPHAN_ICE2_STATUS_EXCLUDED"] == 1
+    assert counts["ORPHAN_ICE2_TEAM_EXCLUDED"] == 1
     assert ice2_side_total == counts["TOTAL_ICE2_ROWS"] == len(ice2)
     assert hubscape_side_total == counts["TOTAL_HUBSCAPE_ROWS"] == len(hub)

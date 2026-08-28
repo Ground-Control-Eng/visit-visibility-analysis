@@ -9,7 +9,13 @@ from sqlalchemy.dialects import mssql
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import ExcelSourceConfig
-from src.query_databases import ICE2_QUERY_TEMPLATE, _read_excel_table
+from src.query_databases import (
+    ICE2_CONTRACTOR_JOIN_SQL,
+    ICE2_QUERY_TEMPLATE,
+    ICE2_STATUS_LOOKUP_TEMPLATE,
+    get_ice2_status_by_visit_ids,
+    _read_excel_table,
+)
 
 
 def _make_excel_cfg(path):
@@ -79,3 +85,35 @@ def test_ice2_query_keeps_de_teams_when_disabled():
     # `:exclude_de_teams = 0` short-circuits the OR so no row gets dropped on this condition.
     assert "ft.internalcontractor IS NULL OR ft.internalcontractor <> 1" in sql
     assert params["exclude_de_teams"] == 0
+
+
+def test_ice2_query_and_status_lookup_share_identical_contractor_join():
+    # Drift tripwire: ICE2_STATUS_LOOKUP_TEMPLATE's contractor/DE-team resolution must stay
+    # byte-for-byte identical to ICE2_QUERY_TEMPLATE's own join - if someone edits one without
+    # mirroring the other, reconcile.py's ORPHAN_ICE2_TEAM_EXCLUDED classification would silently
+    # stop matching the main extract's own exclusion criteria.
+    assert ICE2_CONTRACTOR_JOIN_SQL in ICE2_QUERY_TEMPLATE
+    assert ICE2_CONTRACTOR_JOIN_SQL in ICE2_STATUS_LOOKUP_TEMPLATE
+
+
+def test_ice2_status_lookup_query_includes_contractor_join_and_columns():
+    query = sqlalchemy.text(ICE2_STATUS_LOOKUP_TEMPLATE).bindparams(
+        sqlalchemy.bindparam("visit_ids", expanding=True)
+    )
+    bound = query.bindparams(visit_ids=["123", "456"])
+    compiled = bound.compile(dialect=mssql.dialect(), compile_kwargs={"render_postcompile": True})
+    sql = str(compiled)
+
+    assert "LEFT JOIN tblContractor ft" in sql
+    assert "j.ContractorID" in sql
+    assert "ft.internalcontractor" in sql
+    assert "WHERE v.VisitID IN" in sql
+    assert set(compiled.params.values()) >= {"123", "456"}
+
+
+def test_get_ice2_status_by_visit_ids_empty_input_returns_expected_columns():
+    # The early-return branch never touches cfg.ice2, so a dummy cfg is safe here.
+    df = get_ice2_status_by_visit_ids(cfg=None, visit_ids=[])
+
+    assert list(df.columns) == ["VisitID", "VisitStatusID", "ContractorID", "internalcontractor"]
+    assert df.empty

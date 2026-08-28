@@ -60,6 +60,25 @@ ORDER BY v.VisitID;
 # column, which is itself sourced from the Visits API's Entitymapping.SourceID - i.e. the
 # API's own authoritative record of which VisitID maps to which API_ID.
 
+# Copied verbatim from the LEFT JOIN block in ICE2_QUERY_TEMPLATE above - not factored into a
+# single literal reused by both, to avoid any risk of altering that already-tested,
+# production-critical query string. test_query_databases.py asserts textual containment between
+# the two so a future edit to one that isn't mirrored in the other fails a test immediately,
+# instead of silently drifting apart (this file's join logic already has, twice: the istest-in-
+# JOIN-not-WHERE fix and the ContractorID-IS-NULL guard).
+ICE2_CONTRACTOR_JOIN_SQL = """    LEFT JOIN (
+        SELECT j.VisitID, jlu.ContractorID,
+               ROW_NUMBER() OVER (PARTITION BY j.VisitID ORDER BY jlu.LabourUsedID DESC) AS rn
+        FROM OM_Job j
+        INNER JOIN Om_Job_Labour_Used jlu ON j.jobid = jlu.jobid
+    ) j ON v.VisitID = j.VisitID AND j.rn = 1
+    -- istest belongs in the JOIN condition, not WHERE: ft is outer-joined, so a visit with no
+    -- resolved contractor at all has ft.istest = NULL, and `WHERE ft.istest = 0` evaluates that
+    -- to UNKNOWN (excluded) under SQL's three-valued logic - silently dropping every visit whose
+    -- team couldn't be resolved instead of surfacing it as internalcontractor = NULL ("Unknown").
+    LEFT JOIN tblContractor ft ON j.ContractorID = ft.intContractorID AND ft.istest = 0
+"""
+
 
 class DatabaseQueryError(Exception):
     def __init__(self, source_name: str, original_exception: Exception):
@@ -125,14 +144,18 @@ def get_ice2_visits(cfg: Config) -> pd.DataFrame:
     )
 
 
-ICE2_STATUS_LOOKUP_TEMPLATE = """
-SELECT v.VisitID, v.VisitStatusID
+ICE2_STATUS_LOOKUP_TEMPLATE = f"""
+SELECT v.VisitID, v.VisitStatusID, j.ContractorID, ft.internalcontractor
 FROM OM_Visit v
-WHERE v.VisitID IN :visit_ids
+{ICE2_CONTRACTOR_JOIN_SQL}WHERE v.VisitID IN :visit_ids
 """
-# No join to OM_Site_Contract/OM_Client_Contract here deliberately - this only confirms whether
-# ICe2 has any record of these specific VisitIDs and what status they're currently in, not
-# re-scoping which visits count as in-business the way ICE2_QUERY_TEMPLATE does.
+# Still deliberately no join to OM_Site_Contract/OM_Client_Contract/OM_Visit_Status - this only
+# confirms whether ICe2 has any record of these specific VisitIDs and what status they're
+# currently in, not re-scoping which visits count as in-business the way ICE2_QUERY_TEMPLATE does.
+# The ContractorID/internalcontractor columns (via the same join ICE2_QUERY_TEMPLATE uses) let
+# reconcile.py tell apart an orphan that's excluded from the main extract by date/status timing
+# (ORPHAN_ICE2_STATUS_EXCLUDED) from one excluded by sql.ice2.excluded_contractor_ids/
+# exclude_de_teams policy (ORPHAN_ICE2_TEAM_EXCLUDED) - instead of conflating both under the former.
 
 
 # SQL Server/ODBC caps a single query at ~2,100 parameters. orphan_candidate_visit_ids can
@@ -143,10 +166,14 @@ MAX_IN_CLAUSE_PARAMS = 2000
 
 def get_ice2_status_by_visit_ids(cfg: Config, visit_ids: list[str]) -> pd.DataFrame:
     """Targeted follow-up lookup for reconcile.orphan_candidate_visit_ids - resolves whether ICe2
-    has any record of a Hubscape-only VisitID at all, and under what current status, regardless
-    of ICE2_QUERY_TEMPLATE's status/date filter."""
+    has any record of a Hubscape-only VisitID at all, under what current status (regardless of
+    ICE2_QUERY_TEMPLATE's status/date filter), and - via the same ContractorID/internalcontractor
+    join ICE2_QUERY_TEMPLATE uses - whether it would additionally have been excluded from the main
+    extract by sql.ice2.excluded_contractor_ids/exclude_de_teams, so reconcile() can tell "excluded
+    by policy" apart from "excluded by date/status timing" instead of conflating both under
+    ORPHAN_ICE2_STATUS_EXCLUDED."""
     if not visit_ids:
-        return pd.DataFrame(columns=["VisitID", "VisitStatusID"])
+        return pd.DataFrame(columns=["VisitID", "VisitStatusID", "ContractorID", "internalcontractor"])
     query = sqlalchemy.text(ICE2_STATUS_LOOKUP_TEMPLATE).bindparams(
         sqlalchemy.bindparam("visit_ids", expanding=True)
     )

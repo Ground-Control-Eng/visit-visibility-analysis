@@ -48,6 +48,15 @@ All settings live in `config.yaml` - no code changes needed to retune:
   `detail.csv`, `summary.csv`, or `missing_from_hubscape_by_year_and_team.csv`. Set to `false`
   once Hubscape starts ingesting DE team visits, to resume tracking them like Subcontractor
   visits.
+- `sql.ice2.excluded_contractor_ids`: specific Field Team `ContractorID`s known not to be ingested
+  into Hubscape yet - same rationale and same omit-from-the-extract-entirely treatment as
+  `exclude_de_teams` above, just for individual contractors rather than the whole DE population.
+- A visit excluded by either setting above that turns out to *already have a matching visit in
+  Hubscape* (i.e. the "not yet ingested" assumption doesn't fully hold for it) isn't silently
+  dropped: it's counted informationally as `ORPHAN_ICE2_TEAM_EXCLUDED` in `summary.csv`/the email,
+  kept distinct from `ORPHAN_ICE2_STATUS_EXCLUDED` (a visit ICe2 knows about that's just currently
+  outside the date/status window - most likely Completed/Cancelled/On-Hold, Hubscape not yet
+  synced). Neither is row-level in `detail.csv`.
 
 The attachment column name/format (`External Visit API Id`) has been confirmed against real
 Hubscape exports. The ICe2 query's `ExpectedStartDate` cutoff is controlled by
@@ -87,6 +96,11 @@ Each run writes to `output/YYYY-MM-DD/`:
   Subcontractor visits slipping through (which shouldn't happen). While `sql.ice2.exclude_de_teams`
   is `true` (the default), DE visits are excluded upstream in the ICe2 extract itself, so the DE
   column here will read zero/near-zero - this is expected, not a sign the gap closed
+- `summary.csv`'s two orphan-adjacent counts (a Hubscape API_ID with no matching ICe2 extract row)
+  are deliberately split: `ORPHAN_ICE2_STATUS_EXCLUDED` (known to ICe2, just outside the current
+  date/status window) vs `ORPHAN_ICE2_TEAM_EXCLUDED` (would have been excluded by
+  `excluded_contractor_ids`/`exclude_de_teams` policy despite already being in Hubscape) - see the
+  Configuration section above
 - `run_log.txt` - full log for this run
 - `hubscape.csv` - parsed Hubscape extract
 - `ice2.csv` / `visits_api.csv` - raw source dumps, only written when `test_mode: true`

@@ -253,6 +253,31 @@ def test_clean_match_produces_no_issue():
     assert int(summary.loc[summary["metric"] == "HUBSCAPE_MATCHED", "count"].iloc[0]) == 1
 
 
+def test_visitid_match_survives_a_blank_visitid_elsewhere_in_the_api_extract():
+    # A blank VisitID on an unrelated API row (an Entitymapping record not yet linked back to
+    # ICe2) used to coerce the whole VisitID column to float64 via a bare astype(str), appending
+    # ".0" to every other VisitID and breaking every ICe2<->API match on this key. VisitID is
+    # deliberately passed as a real int here (not a pre-stringified "6") so a dtype-coercion
+    # regression on the merge key would actually be caught.
+    ice2 = pd.DataFrame([make_ice2_row(6, 20, "In Progress")])
+    api = pd.DataFrame([
+        {"API_ID": "A1", "VisitID": 6, "Title": "In Progress"},
+        {"API_ID": "A_unmapped", "VisitID": None, "Title": "Completed"},
+    ])
+    hub = pd.DataFrame([hub_row("A1")])
+    cfg = make_cfg()
+
+    summary, detail = reconcile(ice2, api, hub, cfg)
+
+    assert "6" not in set(detail["VisitID"])
+    total_alerts = summary.loc[summary["metric"].isin([
+        "ICE2_MISSING_API_MAPPING", "ICE2_API_STATUS_MISMATCH",
+        "MISSING_FROM_HUBSCAPE", "ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2",
+    ]), "count"].sum()
+    assert total_alerts == 0
+    assert int(summary.loc[summary["metric"] == "ICE2_MATCHED_OK", "count"].iloc[0]) == 1
+
+
 def test_hubscape_row_missing_api_id_is_counted_not_dropped():
     ice2 = pd.DataFrame([make_ice2_row("7", 20, "In Progress")])
     api = pd.DataFrame([{"API_ID": "A1", "VisitID": "7", "Title": "In Progress"}])

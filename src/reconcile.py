@@ -59,10 +59,15 @@ def _merge_and_classify_base(ice2_df: pd.DataFrame, api_df: pd.DataFrame, hub_df
     follow-up query) and `reconcile` (called after it) so the two never drift apart.
     """
     ice2 = ice2_df.copy()
-    ice2["VisitID"] = ice2["VisitID"].astype(str).str.strip()
+    ice2["VisitID"] = _to_nullable_str_id(ice2["VisitID"])
 
     api = api_df.copy()
-    api["VisitID"] = api["VisitID"].astype(str).str.strip()
+    # VisitID, like API_ID, arrives from the Excel-sourced Visits API extract and can carry a
+    # blank cell (an Entitymapping record not yet linked back to ICe2). A bare astype(str) would
+    # coerce the whole column to float64 the moment any one row is missing, appending ".0" to
+    # every other VisitID and silently breaking every ICe2<->API match on this key - use the same
+    # NaN-safe normalization as API_ID instead.
+    api["VisitID"] = _to_nullable_str_id(api["VisitID"])
     api["API_ID"] = _to_nullable_str_id(api["API_ID"])
     status_title_col = cfg.visits_api_status_title_column
     if status_title_col not in api.columns:

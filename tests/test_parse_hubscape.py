@@ -20,6 +20,7 @@ def make_cfg() -> Config:
         ),
         ice2_query_start_date="2024-04-01",
         ice2_excluded_contractor_ids=[],
+        ice2_exclude_de_teams=False,
         visits_api_status_title_column="Title",
         recent_window_days=30,
         legitimately_excluded_from_hubscape={50, 60, 70},

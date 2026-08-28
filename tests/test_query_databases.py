@@ -37,11 +37,15 @@ def test_read_excel_table_matches_visits_api_shape(tmp_path):
     assert df.loc[0, "Title"] == "Completed"
 
 
-def _compile_ice2_query(excluded_contractor_ids):
+def _compile_ice2_query(excluded_contractor_ids, exclude_de_teams=True):
     query = sqlalchemy.text(ICE2_QUERY_TEMPLATE).bindparams(
         sqlalchemy.bindparam("excluded_contractor_ids", expanding=True)
     )
-    bound = query.bindparams(start_date="2025-10-01", excluded_contractor_ids=excluded_contractor_ids)
+    bound = query.bindparams(
+        start_date="2025-10-01",
+        excluded_contractor_ids=excluded_contractor_ids,
+        exclude_de_teams=1 if exclude_de_teams else 0,
+    )
     compiled = bound.compile(dialect=mssql.dialect(), compile_kwargs={"render_postcompile": True})
     return str(compiled), compiled.params
 
@@ -59,3 +63,19 @@ def test_ice2_query_with_no_excluded_contractor_ids_excludes_nothing():
     sql, _ = _compile_ice2_query([])
 
     assert "NOT IN (SELECT 1 WHERE 1!=1)" in sql
+
+
+def test_ice2_query_excludes_de_teams_when_enabled():
+    sql, params = _compile_ice2_query([], exclude_de_teams=True)
+
+    assert "ft.internalcontractor IS NULL OR ft.internalcontractor <> 1" in sql
+    assert params["exclude_de_teams"] == 1
+
+
+def test_ice2_query_keeps_de_teams_when_disabled():
+    sql, params = _compile_ice2_query([], exclude_de_teams=False)
+
+    # The clause is static SQL either way (the toggle is the bind value, not a string swap) -
+    # `:exclude_de_teams = 0` short-circuits the OR so no row gets dropped on this condition.
+    assert "ft.internalcontractor IS NULL OR ft.internalcontractor <> 1" in sql
+    assert params["exclude_de_teams"] == 0

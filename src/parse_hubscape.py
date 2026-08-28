@@ -37,6 +37,10 @@ def parse_attachment(path: Path, cfg: Config) -> pd.DataFrame:
     # Hubscape only ever exposes the API_ID it received via the Visits API - it has no
     # knowledge of ICe2's own VisitID.
     df = df.rename(columns={api_id_col: "API_ID"})
-    df["API_ID"] = df["API_ID"].astype(str).str.strip()
+    # A blank API_ID cell must stay real NaN so reconcile.py's HUBSCAPE_MISSING_API_ID accounting
+    # can count it - a bare astype(str) risks stringifying it to the literal "nan" on some pandas
+    # versions, which pd.isna()/.dropna() downstream would no longer recognize as missing.
+    api_id = df["API_ID"]
+    df["API_ID"] = api_id.where(api_id.isna(), api_id.astype(str).str.strip())
     logger.info("Parsed %d active visit rows from Hubscape attachment %s", len(df), path)
     return df

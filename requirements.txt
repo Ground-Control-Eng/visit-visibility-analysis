@@ -1,0 +1,7 @@
+pandas>=2.0
+pyodbc>=5.0
+SQLAlchemy>=2.0
+pywin32>=306
+PyYAML>=6.0
+pytest>=8.0
+openpyxl>=3.1

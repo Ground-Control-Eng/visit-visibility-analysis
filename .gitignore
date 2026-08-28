@@ -1,0 +1,17 @@
+# Generated run output and real production data extracts
+output/
+samples/
+*.xlsx
+
+# Local Claude Code tooling config/plans
+.claude/
+
+# Python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments / local env config
+.venv/
+venv/
+.env

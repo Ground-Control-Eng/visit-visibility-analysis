@@ -1,0 +1,69 @@
+# Configuration for the daily Hubscape / Visits API / ICe2 visit reconciliation.
+# Edit this file to retune the automation without touching any code.
+
+sql:
+  ice2:
+    server: "GCV-PROD-SQL01"
+    database: "information_centre"
+    driver: "ODBC Driver 17 for SQL Server"
+    auth: "trusted"                 # Windows integrated auth (Trusted_Connection=yes)
+    query_start_date: "2025-10-01"  # CONFIRM: matches the existing workbook's cutoff filter
+  visits_api_excel:
+    # The direct Azure SQL connection (ActiveDirectoryInteractive) needed a fresh interactive
+    # Entra sign-in roughly daily, which an unattended overnight run can't complete. Instead,
+    # this workbook has a live Power Query connection to the same database that a human keeps
+    # warm just by opening it occasionally - the pipeline drives Excel via COM to refresh it
+    # and reads the resulting table instead of querying the database directly.
+    path: "API Status.xlsx"     # relative to the project root, or an absolute path
+    sheet_name: "Visit"
+    table_name: "Query1"
+    status_title_column: "Title"   # CONFIRM against live visitstatus schema
+    # Give up if Excel hasn't finished refreshing the connection within this many seconds.
+    refresh_timeout_seconds: 180
+
+recency:
+  # Hubscape's integration rolled out gradually, so an old visit missing from Hubscape is
+  # expected/low-priority, while a *recent* one missing is a genuine, actionable gap.
+  # A visit counts as "recent" if its ExpectedEndDate (falling back to ExpectedStartDate) is
+  # within this many days of today (including visits still in the future).
+  recent_window_days: 30
+
+statuses:
+  # Statuses that are legitimately excluded from Hubscape's "active visits only" export.
+  legitimately_excluded_from_hubscape: [5, 10, 50, 55, 60, 70]
+  legend:
+    5: "Not Ready To Send"
+    10: "Ready to Send"
+    15: "Visit Sent"
+    20: "In Progress"
+    35: "No Access"
+    50: "Will Never Be Done - Cancelled"
+    55: "On-Hold"
+    60: "Completed"
+    70: "Manually Completed"
+
+email:
+  outlook_profile: null           # null = default Outlook profile
+  trigger:
+    sender_filter: "ci@hubscape.co.uk"
+    subject_contains: ""           # optional extra filter; blank = match on sender alone
+    search_folder: "Inbox"
+    typical_arrival_time: "20:30"
+    lookback_hours: 30             # how far back to search for "today's" email
+    attachment_name_pattern: "production_uncompleted_visits_*.csv"
+  recipients:
+    to: ["alex.clark@ground-control.co.uk"]
+    cc: []
+  send_on_success: true
+  send_on_failure: true
+
+hubscape_columns:
+  # Confirmed against a real export (production_uncompleted_visits_*.csv). Hubscape only
+  # exposes the API_ID it received via the Visits API - it never sees ICe2's own VisitID.
+  api_id_column: "External Visit API Id"
+  status_column: "Status"       # e.g. SCHEDULED / UNSCHEDULED - informational, not currently used for matching
+
+run:
+  output_dir: "./output"
+  keep_days: 90        # local cleanup of old output folders
+  test_mode: false       # true = run the full pipeline but write the would-be email to output/ instead of sending

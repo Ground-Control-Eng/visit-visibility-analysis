@@ -14,6 +14,12 @@ from .config import Config, ExcelSourceConfig, SqlServerConfig
 
 logger = logging.getLogger("visit_reconciliation")
 
+# Deliberately no VisitStatusID filter here: completed/cancelled/on-hold visits must still be
+# extracted so reconcile.py's legitimately_excluded_from_hubscape / LEGITIMATELY_ABSENT_FROM_HUBSCAPE
+# bucketing (informational-only, excluded from alerts/detail.csv) and the by-year/team-type
+# "missing from Hubscape" breakdown have that historic population to work with. Filtering
+# terminal statuses out here instead of downstream would silently exclude them from every
+# accounting/breakdown output rather than just from alerts, which is not the same thing.
 ICE2_QUERY_TEMPLATE = """
 SELECT v.VisitID, v.ExpectedStartDate, v.ExpectedEndDate, v.StartDate, v.EndDate,
        v.VisitStatusID, vs.StatusDescription, j.ContractorID, ft.strName AS FieldTeamName, ft.internalcontractor
@@ -32,8 +38,7 @@ FROM OM_Visit v
     -- to UNKNOWN (excluded) under SQL's three-valued logic - silently dropping every visit whose
     -- team couldn't be resolved instead of surfacing it as internalcontractor = NULL ("Unknown").
     LEFT JOIN tblContractor ft ON j.ContractorID = ft.intContractorID AND ft.istest = 0
-WHERE v.VisitStatusID IN (5,10,15,20,35) -- 50,55,60,70 removed
-  AND v.ExpectedStartDate >= :start_date
+WHERE v.ExpectedStartDate >= :start_date
 ORDER BY v.VisitID;
 """
 # API_ID is no longer sourced from ICe2's own GCIS_API_Record_Mapping table (which could

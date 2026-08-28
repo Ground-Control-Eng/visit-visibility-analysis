@@ -50,7 +50,7 @@ All settings live in `config.yaml` - no code changes needed to retune:
   visits.
 - `sql.ice2.excluded_contractor_ids`: specific Field Team `ContractorID`s known not to be ingested
   into Hubscape yet - same rationale and same omit-from-the-extract-entirely treatment as
-  `exclude_de_teams` above, just for individual contractors rather than the whole DE population.
+  `sql.ice2.exclude_de_teams` above, just for individual contractors rather than the whole DE population.
 - A visit excluded by either setting above that turns out to *already have a matching visit in
   Hubscape* (i.e. the "not yet ingested" assumption doesn't fully hold for it) isn't silently
   dropped: it's counted informationally as `ORPHAN_ICE2_TEAM_EXCLUDED` in `summary.csv`/the email,

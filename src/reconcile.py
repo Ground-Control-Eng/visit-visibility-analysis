@@ -24,6 +24,7 @@ ALERT_ISSUE_TYPES = [
 # priority, not a defect - it's counted but kept out of the alert-worthy total.
 INFORMATIONAL_ISSUE_TYPES = [
     "LEGITIMATELY_ABSENT_FROM_HUBSCAPE", "MISSING_FROM_HUBSCAPE_HISTORIC", "ORPHAN_ICE2_STATUS_EXCLUDED",
+    "ORPHAN_ICE2_TEAM_EXCLUDED",
 ]
 ALL_ISSUE_TYPES = ALERT_ISSUE_TYPES + INFORMATIONAL_ISSUE_TYPES
 
@@ -210,14 +211,21 @@ def reconcile(
     summary_df: one row per issue_type with a count column, plus source row-count rows.
     detail_df: one row per flagged VisitID with its issue_type and key context columns.
 
-    orphan_status_lookup: optional (VisitID, VisitStatusID) DataFrame from
-    `query_databases.get_ice2_status_by_visit_ids`, covering the VisitIDs returned by
-    `orphan_candidate_visit_ids` for this same input. When supplied, an orphan candidate whose
-    VisitID resolves here is reclassified from ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2 (implying ICe2 has
-    never heard of it) to the informational ORPHAN_ICE2_STATUS_EXCLUDED (ICe2 knows it, it's just
-    excluded from the extract by its current status/date - most likely Completed/Cancelled/
-    On-Hold and Hubscape hasn't synced yet). When omitted, every orphan candidate is classified
-    as ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2, matching this function's pre-split behavior.
+    orphan_status_lookup: optional (VisitID, VisitStatusID, ContractorID, internalcontractor)
+    DataFrame from `query_databases.get_ice2_status_by_visit_ids`, covering the VisitIDs returned
+    by `orphan_candidate_visit_ids` for this same input. When supplied, an orphan candidate whose
+    VisitID doesn't resolve here stays ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2 (ICe2 has never heard of it).
+    One that resolves is reclassified into one of two informational buckets, so "excluded by
+    timing" and "excluded by policy" aren't conflated: ORPHAN_ICE2_STATUS_EXCLUDED (ICe2 knows it,
+    it's just excluded from the extract by its current status/date - most likely Completed/
+    Cancelled/On-Hold and Hubscape hasn't synced yet) or ORPHAN_ICE2_TEAM_EXCLUDED (it would
+    additionally have tripped sql.ice2.excluded_contractor_ids/exclude_de_teams - i.e. Hubscape
+    already has a visit that the "not yet ingested" exclusion assumed it wouldn't). A resolved
+    orphan whose ContractorID/internalcontractor didn't come back (unresolved team, or an older/
+    hand-built lookup lacking those columns) is never treated as team-excluded, same "unresolved
+    isn't known to be X" principle ICE2_QUERY_TEMPLATE's own IS NULL guards apply. When
+    orphan_status_lookup is omitted, every orphan candidate is classified as
+    ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2, matching this function's pre-split behavior.
     """
     merged, api, hub, hub_api_ids, orphan_ids = _merge_and_classify_base(ice2_df, api_df, hub_df, cfg)
 
@@ -269,11 +277,12 @@ def reconcile(
     ice2_matched_ok = int(merged["issue_type"].isna().sum())
 
     # --- Step 4: classify orphans ---
-    # An orphan candidate whose VisitID resolves in orphan_status_lookup is known to ICe2 - it's
-    # just excluded from the (status/date-filtered) extract, most likely because its status has
-    # since moved to Completed/Cancelled/On-Hold and Hubscape hasn't synced yet. Only a candidate
-    # that resolves to no VisitID at all, or whose VisitID isn't found even in this broader
-    # lookup, is genuinely unknown to ICe2.
+    # An orphan candidate whose VisitID resolves in orphan_status_lookup is known to ICe2 - either
+    # it's excluded from the extract by its current status/date (most likely Completed/Cancelled/
+    # On-Hold and Hubscape hasn't synced yet - ORPHAN_ICE2_STATUS_EXCLUDED), or it would have been
+    # excluded by excluded_contractor_ids/exclude_de_teams policy despite already being in Hubscape
+    # (ORPHAN_ICE2_TEAM_EXCLUDED). Only a candidate that resolves to no VisitID at all, or whose
+    # VisitID isn't found even in this broader lookup, is genuinely unknown to ICe2.
     orphans = hub[hub["API_ID"].isin(orphan_ids)].copy()
     orphans["issue_type"] = "ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2"
     if orphan_status_lookup is not None and not orphan_status_lookup.empty:
@@ -285,7 +294,39 @@ def reconcile(
         orphans["VisitID"] = orphans["API_ID"].map(api_id_to_visit_id)
         orphans["VisitStatusID"] = orphans["VisitID"].map(status_by_visit_id)
         resolved_mask = orphans["VisitStatusID"].notna()
-        orphans.loc[resolved_mask, "issue_type"] = "ORPHAN_ICE2_STATUS_EXCLUDED"
+
+        # A resolved orphan is "team excluded" (a distinct, informational-only population from
+        # "status excluded") if it would have tripped either of ICE2_QUERY_TEMPLATE's own
+        # exclusion filters - excluded_contractor_ids OR exclude_de_teams - despite already
+        # existing in Hubscape. Either condition alone is sufficient (OR, matching the WHERE
+        # clause's own OR), so a visit meeting both isn't double-counted. A resolved orphan whose
+        # ContractorID/internalcontractor came back NaN (team unresolved) or wasn't present at all
+        # (older caller / hand-built lookup without these columns) is never treated as excluded -
+        # same "unresolved isn't known to be X" principle ICE2_QUERY_TEMPLATE's own IS NULL guards
+        # already apply.
+        if "ContractorID" in lookup.columns:
+            contractor_by_visit_id = dict(zip(lookup["VisitID"], lookup["ContractorID"].map(_normalize_id)))
+            orphan_contractor_id = orphans["VisitID"].map(contractor_by_visit_id)
+        else:
+            orphan_contractor_id = pd.Series(None, index=orphans.index)
+        excluded_contractor_ids = {_normalize_id(c) for c in cfg.ice2_excluded_contractor_ids}
+        contractor_excluded = orphan_contractor_id.isin(excluded_contractor_ids)
+
+        if "internalcontractor" in lookup.columns:
+            de_flag_by_visit_id = dict(zip(lookup["VisitID"], lookup["internalcontractor"]))
+            orphan_de_flag = orphans["VisitID"].map(de_flag_by_visit_id)
+        else:
+            orphan_de_flag = pd.Series(None, index=orphans.index)
+        if cfg.ice2_exclude_de_teams:
+            de_excluded = orphan_de_flag.notna() & (orphan_de_flag.astype(float) == 1)
+        else:
+            de_excluded = pd.Series(False, index=orphans.index)
+
+        team_excluded_mask = resolved_mask & (contractor_excluded | de_excluded)
+        status_excluded_mask = resolved_mask & ~team_excluded_mask
+
+        orphans.loc[status_excluded_mask, "issue_type"] = "ORPHAN_ICE2_STATUS_EXCLUDED"
+        orphans.loc[team_excluded_mask, "issue_type"] = "ORPHAN_ICE2_TEAM_EXCLUDED"
 
     # --- Hubscape-side accounting, computed straight from hub (not from merged) so it's an
     # independent check rather than a re-derivation of the same numbers ---
@@ -308,8 +349,10 @@ def reconcile(
             f"(TOTAL_ICE2_ROWS). Some row was left unclassified or double-classified."
         )
 
-    hubscape_orphan_total = int((orphans["issue_type"] == "ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2").sum()) + int(
-        (orphans["issue_type"] == "ORPHAN_ICE2_STATUS_EXCLUDED").sum()
+    hubscape_orphan_total = (
+        int((orphans["issue_type"] == "ORPHAN_IN_HUBSCAPE_NOT_IN_ICE2").sum())
+        + int((orphans["issue_type"] == "ORPHAN_ICE2_STATUS_EXCLUDED").sum())
+        + int((orphans["issue_type"] == "ORPHAN_ICE2_TEAM_EXCLUDED").sum())
     )
     hubscape_side_total = hubscape_matched + hubscape_missing_api_id + hubscape_orphan_total
     if hubscape_side_total != len(hub):
@@ -320,8 +363,8 @@ def reconcile(
 
     # --- Step 5: assemble detail_df ---
     # Informational issue types (LEGITIMATELY_ABSENT_FROM_HUBSCAPE, MISSING_FROM_HUBSCAPE_HISTORIC,
-    # ORPHAN_ICE2_STATUS_EXCLUDED) can be huge - they're counted in summary_df but excluded from
-    # the row-level detail_df so it stays small and actionable.
+    # ORPHAN_ICE2_STATUS_EXCLUDED, ORPHAN_ICE2_TEAM_EXCLUDED) can be huge - they're counted in
+    # summary_df but excluded from the row-level detail_df so it stays small and actionable.
     flagged = merged[merged["issue_type"].isin(ALERT_ISSUE_TYPES)].copy()
     orphans_flagged = orphans[orphans["issue_type"].isin(ALERT_ISSUE_TYPES)].copy()
     informational_counts = {

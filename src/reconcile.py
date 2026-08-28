@@ -4,11 +4,14 @@ No I/O here by design - fully unit-testable against synthetic DataFrames.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pandas as pd
 
 from .config import Config
+
+logger = logging.getLogger("visit_reconciliation")
 
 # Alert-worthy issue types, in the order they should be presented in the summary email.
 ALERT_ISSUE_TYPES = [
@@ -172,7 +175,11 @@ def missing_from_hubscape_breakdown(
     missing_mask = merged["expected_in_hubscape"] & ~merged["in_hubscape"] & merged["issue_type"].isna()
     missing = merged[missing_mask].copy()
 
-    missing["year"] = pd.to_datetime(missing["ExpectedStartDate"], errors="coerce").dt.year
+    year = pd.to_datetime(missing["ExpectedStartDate"], errors="coerce").dt.year
+    # DataFrame.groupby defaults to dropna=True, which would silently drop a row with an
+    # unparseable ExpectedStartDate from this breakdown entirely instead of counting it somewhere
+    # - label it "Unknown" instead so every row that went into `missing` above still shows up.
+    missing["year"] = year.apply(lambda y: "Unknown" if pd.isna(y) else int(y))
     missing["team_type"] = classify_team_type(missing["internalcontractor"], cfg)
 
     breakdown = (
@@ -181,6 +188,12 @@ def missing_from_hubscape_breakdown(
         .sort_values(["year", "team_type"])
         .reset_index(drop=True)
     )
+
+    if int(breakdown["count"].sum()) != len(missing):
+        raise ReconciliationCompletenessError(
+            f"missing_from_hubscape_breakdown buckets sum to {int(breakdown['count'].sum())}, "
+            f"expected {len(missing)}. Some row was left unclassified or double-classified."
+        )
     return breakdown
 
 
@@ -227,7 +240,20 @@ def reconcile(
     recency_date = pd.to_datetime(merged["ExpectedEndDate"], errors="coerce").fillna(
         pd.to_datetime(merged["ExpectedStartDate"], errors="coerce")
     )
-    is_recent = recency_date >= cutoff
+    # A row whose ExpectedEndDate and ExpectedStartDate are both blank/unparseable must not
+    # silently fall through to "not recent" (NaT >= cutoff is always False) - that would demote a
+    # genuinely actionable gap to the informational, unalerted MISSING_FROM_HUBSCAPE_HISTORIC
+    # bucket just because of bad source data. Treat it as recent (fail toward alerting) and log it
+    # so the bad date is visible.
+    date_unparseable = recency_date.isna()
+    if date_unparseable.any():
+        logger.warning(
+            "ExpectedStartDate/ExpectedEndDate unparseable for %d visit(s); treating as recent "
+            "rather than historic so they aren't silently hidden from alerts: %s",
+            int(date_unparseable.sum()),
+            merged.loc[date_unparseable, "VisitID"].tolist(),
+        )
+    is_recent = (recency_date >= cutoff) | date_unparseable
 
     missing_mask = merged["expected_in_hubscape"] & ~merged["in_hubscape"] & merged["issue_type"].isna()
     merged.loc[missing_mask & is_recent, "issue_type"] = "MISSING_FROM_HUBSCAPE"

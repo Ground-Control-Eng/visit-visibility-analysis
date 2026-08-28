@@ -102,6 +102,25 @@ def test_missing_from_hubscape_when_active_but_historic():
     assert int(summary.loc[summary["metric"] == "MISSING_FROM_HUBSCAPE_HISTORIC", "count"].iloc[0]) == 1
 
 
+def test_missing_from_hubscape_with_unparseable_dates_treated_as_recent_not_dropped():
+    # An unparseable ExpectedStartDate/ExpectedEndDate must not silently fall through to
+    # "not recent" (NaT >= cutoff is always False) and get hidden in the informational
+    # MISSING_FROM_HUBSCAPE_HISTORIC bucket just because of bad source data.
+    ice2 = pd.DataFrame([{
+        **make_ice2_row("3u", 20, "In Progress"),
+        "ExpectedStartDate": "not-a-date", "ExpectedEndDate": None,
+    }])
+    api = pd.DataFrame([{"API_ID": "A1", "VisitID": "3u", "Title": "In Progress"}])
+    hub = pd.DataFrame([], columns=["API_ID"])
+    cfg = make_cfg()
+
+    summary, detail = reconcile(ice2, api, hub, cfg, reference_date=date(2026, 12, 1))
+
+    assert "3u" in set(detail.loc[detail["issue_type"] == "MISSING_FROM_HUBSCAPE", "VisitID"])
+    assert int(summary.loc[summary["metric"] == "MISSING_FROM_HUBSCAPE", "count"].iloc[0]) == 1
+    assert int(summary.loc[summary["metric"] == "MISSING_FROM_HUBSCAPE_HISTORIC", "count"].iloc[0]) == 0
+
+
 def test_detail_df_surfaces_internalcontractor_as_bool():
     ice2 = pd.DataFrame([
         {**make_ice2_row("3de", 20, "In Progress"), "internalcontractor": 1},
@@ -233,6 +252,25 @@ def test_missing_from_hubscape_breakdown_spans_recent_and_historic_years():
 
     assert breakdown_lookup == {(2026, "DE"): 1, (2024, "Subcontractor"): 1}
     assert (2026, "Subcontractor") not in breakdown_lookup
+
+
+def test_missing_from_hubscape_breakdown_keeps_rows_with_unparseable_dates():
+    # groupby()'s default dropna=True would otherwise silently drop a row with an unparseable
+    # ExpectedStartDate from the breakdown entirely - it must still be counted, under an
+    # "Unknown" year, rather than vanishing.
+    cfg = make_cfg()
+    ice2 = pd.DataFrame([{
+        **make_ice2_row("13", 20, "In Progress"), "ExpectedStartDate": "not-a-date",
+        "ExpectedEndDate": "not-a-date", "internalcontractor": 1,
+    }])
+    api = pd.DataFrame([{"API_ID": "A13", "VisitID": "13", "Title": "In Progress"}])
+    hub = pd.DataFrame([], columns=["API_ID"])
+
+    breakdown = missing_from_hubscape_breakdown(ice2, api, hub, cfg)
+    breakdown_lookup = {(row.year, row.team_type): row.count for row in breakdown.itertuples()}
+
+    assert breakdown_lookup == {("Unknown", "DE"): 1}
+    assert int(breakdown["count"].sum()) == 1
 
 
 def test_clean_match_produces_no_issue():

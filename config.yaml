@@ -11,6 +11,10 @@ sql:
     # Field Teams not yet ingested into Hubscape - omit entirely from the extract rather than
     # letting them permanently show up as "missing from Hubscape" false positives downstream.
     excluded_contractor_ids: [3244, 8030, 8031]
+    # DE (directly-employed) teams are known not to be ingested into Hubscape yet - omit them
+    # entirely from the extract, same rationale as excluded_contractor_ids above. Flip to false
+    # once Hubscape starts ingesting DE team visits.
+    exclude_de_teams: true
   visits_api_excel:
     # The direct Azure SQL connection (ActiveDirectoryInteractive) needed a fresh interactive
     # Entra sign-in roughly daily, which an unattended overnight run can't complete. Instead,

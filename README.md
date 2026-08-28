@@ -41,9 +41,13 @@ All settings live in `config.yaml` - no code changes needed to retune:
   saves the raw ICe2/Visits API extracts there for debugging. Set to `false` once you're
   confident in the output, before relying on the live scheduled run.
 - DE (directly-employed) vs Subcontractor classification comes straight from ICe2's
-  `ft.internalcontractor` flag (`1` = DE, `0` = Subcontractor) in `ICE2_QUERY_TEMPLATE` -
-  no config needed. A visit whose team couldn't be resolved (no `Om_Job_Labour_Used` match)
-  is classified `Unknown`.
+  `ft.internalcontractor` flag (`1` = DE, `0` = Subcontractor) in `ICE2_QUERY_TEMPLATE`.
+  A visit whose team couldn't be resolved (no `Om_Job_Labour_Used` match) is classified `Unknown`.
+- `sql.ice2.exclude_de_teams`: DE teams are known not to be ingested into Hubscape yet, so by
+  default (`true`) their visits are omitted from the ICe2 extract entirely - they won't appear in
+  `detail.csv`, `summary.csv`, or `missing_from_hubscape_by_year_and_team.csv`. Set to `false`
+  once Hubscape starts ingesting DE team visits, to resume tracking them like Subcontractor
+  visits.
 
 The attachment column name/format (`External Visit API Id`) has been confirmed against real
 Hubscape exports. The ICe2 query's `ExpectedStartDate` cutoff is controlled by
@@ -79,8 +83,10 @@ Each run writes to `output/YYYY-MM-DD/`:
   the informational `LEGITIMATELY_ABSENT_FROM_HUBSCAPE` count is in `summary.csv` only, since
   it covers every historically completed/cancelled visit and would otherwise dominate the file)
 - `missing_from_hubscape_by_year_and_team.csv` - year x team-type (DE / Subcontractor / Unknown)
-  counts of every visit missing from Hubscape (recent and historic combined), to track the known
-  DE ingestion gap and catch any subcontractor visits slipping through (which shouldn't happen)
+  counts of every visit missing from Hubscape (recent and historic combined), to catch any
+  Subcontractor visits slipping through (which shouldn't happen). While `sql.ice2.exclude_de_teams`
+  is `true` (the default), DE visits are excluded upstream in the ICe2 extract itself, so the DE
+  column here will read zero/near-zero - this is expected, not a sign the gap closed
 - `run_log.txt` - full log for this run
 - `hubscape.csv` - parsed Hubscape extract
 - `ice2.csv` / `visits_api.csv` - raw source dumps, only written when `test_mode: true`

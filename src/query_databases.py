@@ -44,6 +44,14 @@ WHERE v.ExpectedStartDate >= :start_date
     -- `NOT IN` would evaluate that to UNKNOWN (excluded) under three-valued logic - silently
     -- dropping unresolved-team visits instead of just the specific excluded contractors.
     AND (j.ContractorID IS NULL OR j.ContractorID NOT IN :excluded_contractor_ids)
+    -- DE (directly-employed) teams are known not to be ingested into Hubscape yet; when
+    -- exclude_de_teams is on, omit them from the extract too rather than letting them
+    -- permanently show up as "missing from Hubscape" false positives, same rationale as
+    -- excluded_contractor_ids above. Config-driven (sql.ice2.exclude_de_teams) so it can be
+    -- flipped off once DE ingestion lands, without a code change. ft.internalcontractor IS NULL
+    -- (unresolved team) must stay in regardless - same three-valued-logic trap as above, since an
+    -- unresolved visit isn't known to be DE.
+    AND (:exclude_de_teams = 0 OR ft.internalcontractor IS NULL OR ft.internalcontractor <> 1)
 ORDER BY v.VisitID;
 """
 # API_ID is no longer sourced from ICe2's own GCIS_API_Record_Mapping table (which could
@@ -112,6 +120,7 @@ def get_ice2_visits(cfg: Config) -> pd.DataFrame:
         params={
             "start_date": cfg.ice2_query_start_date,
             "excluded_contractor_ids": cfg.ice2_excluded_contractor_ids,
+            "exclude_de_teams": 1 if cfg.ice2_exclude_de_teams else 0,
         },
     )
 

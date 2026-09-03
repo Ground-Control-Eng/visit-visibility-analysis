@@ -59,7 +59,7 @@ email:
     lookback_hours: 12             # how far back to search for "today's" email
     attachment_name_pattern: "production_uncompleted_visits_*.csv"
   recipients:
-    to: ["alex.clark@ground-control.co.uk", "Chris.Beanland@ground-control.co.uk"]
+    to: ["alex.clark@ground-control.co.uk", "chris.beanland@ground-control.co.uk", "eion.donnelly@ground-control.co.uk"]
     cc: []
   send_on_success: true
   send_on_failure: true

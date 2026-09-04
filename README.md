@@ -96,6 +96,11 @@ Each run writes to `output/YYYY-MM-DD/`:
   Subcontractor visits slipping through (which shouldn't happen). While `sql.ice2.exclude_de_teams`
   is `true` (the default), DE visits are excluded upstream in the ICe2 extract itself, so the DE
   column here will read zero/near-zero - this is expected, not a sign the gap closed
+- `detail.csv`'s `repeat_failure` column flags an `ICE2_MISSING_API_MAPPING` VisitID that was
+  *also* missing in the most recent prior run (searching back up to 7 days, to ride out a day the
+  pipeline didn't run) - i.e. the Visits API's overnight retry failed to map it again. These rows
+  are bold/red-highlighted in the summary email's discrepancy table, with a callout near the top
+  listing the affected VisitIDs, and counted in `summary.csv` as `ICE2_MISSING_API_MAPPING_REPEAT`.
 - `summary.csv`'s two orphan-adjacent counts (a Hubscape API_ID with no matching ICe2 extract row)
   are deliberately split: `ORPHAN_ICE2_STATUS_EXCLUDED` (known to ICe2, just outside the current
   date/status window) vs `ORPHAN_ICE2_TEAM_EXCLUDED` (would have been excluded by

@@ -141,6 +141,21 @@ def orphan_candidate_visit_ids(ice2_df: pd.DataFrame, api_df: pd.DataFrame, hub_
     return sorted(set(resolvable["VisitID"].dropna()))
 
 
+def flag_repeat_missing_api_mapping(detail_df: pd.DataFrame, previous_missing_ids: set[str]) -> pd.DataFrame:
+    """Marks ICE2_MISSING_API_MAPPING rows whose VisitID was also missing in the prior run being
+    compared against (see history.find_previous_detail_csv/load_missing_api_mapping_ids) - i.e.
+    still unmapped after the API's overnight retry had another chance at it. Adds a `repeat_failure`
+    bool column to a copy of detail_df; every other row (different issue_type, or a VisitID not in
+    previous_missing_ids) is False. Pure - previous_missing_ids is passed in, no file access here.
+    """
+    detail_df = detail_df.copy()
+    detail_df["repeat_failure"] = (
+        (detail_df["issue_type"] == "ICE2_MISSING_API_MAPPING")
+        & detail_df["VisitID"].isin(previous_missing_ids)
+    )
+    return detail_df
+
+
 def classify_team_type(internal_contractor_flags: pd.Series, cfg: Config) -> pd.Series:
     """Classifies each visit as "DE" (directly-employed), "Subcontractor", or "Unknown" from
     ft.internalcontractor (1/0), sourced authoritatively from ICe2's tblContractor rather than

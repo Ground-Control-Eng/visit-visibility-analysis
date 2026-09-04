@@ -15,7 +15,9 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from . import fetch_email, parse_hubscape, query_databases, reconcile, send_summary, visualize
+import pandas as pd
+
+from . import fetch_email, history, parse_hubscape, query_databases, reconcile, send_summary, visualize
 from .config import Config, ConfigError, load_config
 from .logging_setup import setup_logging
 
@@ -88,6 +90,21 @@ def run(dry_run_email_path: Path | None = None) -> int:
         summary_df, detail_df = reconcile.reconcile(
             ice2_df, api_df, hub_df, cfg, orphan_status_lookup=orphan_status_df,
         )
+
+        stage = "repeat_failure_check"
+        previous_detail_csv = history.find_previous_detail_csv(cfg.run.output_dir, run_date)
+        previous_missing_ids = history.load_missing_api_mapping_ids(previous_detail_csv)
+        detail_df = reconcile.flag_repeat_missing_api_mapping(detail_df, previous_missing_ids)
+        repeat_count = int(detail_df["repeat_failure"].sum())
+        summary_df = pd.concat(
+            [summary_df, pd.DataFrame([{"metric": "ICE2_MISSING_API_MAPPING_REPEAT", "count": repeat_count}])],
+            ignore_index=True,
+        )
+        logger.info(
+            "Repeat-failure check: %d VisitID(s) still missing API mapping vs. prior run at %s",
+            repeat_count, previous_detail_csv,
+        )
+
         summary_df.to_csv(run_output_dir / "summary.csv", index=False)
         detail_df.to_csv(run_output_dir / "detail.csv", index=False)
         logger.info("Reconciliation complete: %s", summary_df.to_dict(orient="records"))

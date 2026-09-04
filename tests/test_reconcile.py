@@ -8,7 +8,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import Config, EmailConfig, EmailTriggerConfig, ExcelSourceConfig, RunConfig, SqlServerConfig
-from src.reconcile import classify_team_type, missing_from_hubscape_breakdown, orphan_candidate_visit_ids, reconcile
+from src.reconcile import (
+    classify_team_type,
+    flag_repeat_missing_api_mapping,
+    missing_from_hubscape_breakdown,
+    orphan_candidate_visit_ids,
+    reconcile,
+)
 
 
 def make_cfg() -> Config:
@@ -77,6 +83,37 @@ def test_missing_api_mapping():
 
     assert detail.loc[detail["VisitID"] == "2", "issue_type"].iloc[0] == "ICE2_MISSING_API_MAPPING"
     assert int(summary.loc[summary["metric"] == "ICE2_MISSING_API_MAPPING", "count"].iloc[0]) == 1
+
+
+def test_flag_repeat_missing_api_mapping_marks_ids_seen_in_prior_run():
+    detail = pd.DataFrame([
+        {"VisitID": "2", "issue_type": "ICE2_MISSING_API_MAPPING"},
+        {"VisitID": "3", "issue_type": "ICE2_MISSING_API_MAPPING"},
+    ])
+
+    flagged = flag_repeat_missing_api_mapping(detail, previous_missing_ids={"2"})
+
+    assert bool(flagged.loc[flagged["VisitID"] == "2", "repeat_failure"].iloc[0]) is True
+    assert bool(flagged.loc[flagged["VisitID"] == "3", "repeat_failure"].iloc[0]) is False
+
+
+def test_flag_repeat_missing_api_mapping_ignores_other_issue_types():
+    # A VisitID that happens to match previous_missing_ids but isn't ICE2_MISSING_API_MAPPING
+    # today (e.g. it got mapped but now has a status mismatch) must not be flagged as a repeat -
+    # the flag is specifically about the mapping still being missing, not VisitID recurrence.
+    detail = pd.DataFrame([{"VisitID": "2", "issue_type": "ICE2_API_STATUS_MISMATCH"}])
+
+    flagged = flag_repeat_missing_api_mapping(detail, previous_missing_ids={"2"})
+
+    assert bool(flagged.loc[flagged["VisitID"] == "2", "repeat_failure"].iloc[0]) is False
+
+
+def test_flag_repeat_missing_api_mapping_with_no_prior_data():
+    detail = pd.DataFrame([{"VisitID": "2", "issue_type": "ICE2_MISSING_API_MAPPING"}])
+
+    flagged = flag_repeat_missing_api_mapping(detail, previous_missing_ids=set())
+
+    assert bool(flagged.loc[flagged["VisitID"] == "2", "repeat_failure"].iloc[0]) is False
 
 
 def test_missing_from_hubscape_when_active_and_recent():

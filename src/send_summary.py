@@ -12,12 +12,40 @@ from .reconcile import ALERT_ISSUE_TYPES, INFORMATIONAL_ISSUE_TYPES, RECONCILIAT
 
 logger = logging.getLogger("visit_reconciliation")
 
+# Matches COLOR_CRITICAL in visualize.py - kept as a local literal rather than an import so the
+# two modules stay decoupled.
+REPEAT_FAILURE_ROW_STYLE = "background-color:#fbe1e1;font-weight:bold"
+
 
 def _df_to_html_table(df: pd.DataFrame, max_rows: int | None = None) -> str:
     if df.empty:
         return "<p><em>No rows.</em></p>"
     shown = df.head(max_rows) if max_rows else df
     html = shown.to_html(index=False, border=1)
+    if max_rows and len(df) > max_rows:
+        html += f"<p><em>Showing first {max_rows} of {len(df)} rows - see attached CSV for full detail.</em></p>"
+    return html
+
+
+def _alert_detail_html(df: pd.DataFrame, max_rows: int | None = None) -> str:
+    """Like _df_to_html_table, but bold/red-highlights rows where repeat_failure is True - a
+    VisitID that's still ICE2_MISSING_API_MAPPING after also being missing in the prior run
+    (i.e. the API's overnight retry failed for it again)."""
+    if df.empty:
+        return "<p><em>No rows.</em></p>"
+    shown = df.head(max_rows) if max_rows else df
+    display_cols = [c for c in shown.columns if c != "repeat_failure"]
+    has_repeat_flag = "repeat_failure" in shown.columns
+
+    header = "".join(f"<th>{col}</th>" for col in display_cols)
+    body_rows = []
+    for _, row in shown.iterrows():
+        is_repeat = has_repeat_flag and bool(row["repeat_failure"])
+        tr_style = f' style="{REPEAT_FAILURE_ROW_STYLE}"' if is_repeat else ""
+        cells = "".join(f"<td>{row[col]}</td>" for col in display_cols)
+        body_rows.append(f"<tr{tr_style}>{cells}</tr>")
+
+    html = f"<table border=\"1\"><thead><tr>{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
     if max_rows and len(df) > max_rows:
         html += f"<p><em>Showing first {max_rows} of {len(df)} rows - see attached CSV for full detail.</em></p>"
     return html
@@ -36,6 +64,17 @@ def _build_success_html(summary_df: pd.DataFrame, detail_df: pd.DataFrame, run_d
                          extra_notes: list[str], breakdown_df: pd.DataFrame | None = None) -> str:
     counts = dict(zip(summary_df["metric"], summary_df["count"]))
     total_alerts = sum(counts.get(t, 0) for t in ALERT_ISSUE_TYPES)
+
+    repeat_count = int(counts.get("ICE2_MISSING_API_MAPPING_REPEAT", 0))
+    repeat_callout_html = ""
+    if repeat_count and "repeat_failure" in detail_df.columns:
+        repeat_ids = sorted(detail_df.loc[detail_df["repeat_failure"], "VisitID"].astype(str))
+        repeat_callout_html = (
+            f'<p style="{REPEAT_FAILURE_ROW_STYLE}">'
+            f"&#9888; {repeat_count} VisitID(s) still missing an API mapping after also being "
+            f"missing in the prior run - the overnight retry has failed for these two days "
+            f"running: {', '.join(repeat_ids)}</p>"
+        )
 
     rows_html = "".join(
         f"<tr><td>{t}</td><td style='text-align:right'>{counts.get(t, 0)}</td></tr>"
@@ -69,6 +108,7 @@ def _build_success_html(summary_df: pd.DataFrame, detail_df: pd.DataFrame, run_d
     <html><body>
     <h2>Visit Reconciliation Summary - {run_date.isoformat()}</h2>
     <p><b>{total_alerts}</b> total alert-worthy discrepancies found.</p>
+    {repeat_callout_html}
     {notes_html}
     <h3>Discrepancies</h3>
     <table>{rows_html}</table>
@@ -80,7 +120,7 @@ def _build_success_html(summary_df: pd.DataFrame, detail_df: pd.DataFrame, run_d
     <table>{accounting_rows_html}</table>
     {breakdown_section}
     <h3>Discrepancy detail (first 200 rows)</h3>
-    {_df_to_html_table(alert_detail, max_rows=200)}
+    {_alert_detail_html(alert_detail, max_rows=200)}
     <p>Full detail and logs are attached / saved to the output folder for this run.</p>
     </body></html>
     """

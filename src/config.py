@@ -155,6 +155,9 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     if not email.to:
         raise ConfigError("email.recipients.to must contain at least one recipient.")
 
+    if email.send_confirm_timeout_seconds <= 0:
+        raise ConfigError("email.send_confirm_timeout_seconds must be greater than 0.")
+
     if email.stale_outbox_cleanup_seconds <= email.send_confirm_timeout_seconds:
         raise ConfigError(
             "email.stale_outbox_cleanup_seconds must be greater than send_confirm_timeout_seconds - "

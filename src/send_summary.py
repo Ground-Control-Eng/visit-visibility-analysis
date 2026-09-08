@@ -157,6 +157,19 @@ def is_stale_pipeline_outbox_item(
     return (now - created_at).total_seconds() >= threshold_seconds
 
 
+def _outbox_entry_ids(outbox) -> set[str]:
+    """EntryIDs of all readable Outbox items - skips any item mid-transmission (touching one
+    raises 'Outlook has already begun transmitting this message', which isn't an actual error,
+    just a sign the item is actively going out)."""
+    ids = set()
+    for item in outbox.Items:
+        try:
+            ids.add(item.EntryID)
+        except Exception:  # noqa: BLE001
+            continue
+    return ids
+
+
 def _cleanup_stale_outbox_items(outbox, threshold_seconds: float) -> None:
     """Deletes leftover Outbox items from a previous failed run so they don't sit there
     indefinitely requiring manual cleanup before the next send can get through."""
@@ -169,10 +182,11 @@ def _cleanup_stale_outbox_items(outbox, threshold_seconds: float) -> None:
         except Exception:  # noqa: BLE001
             continue
         created_at = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
-        if not is_stale_pipeline_outbox_item(subject, created_at, datetime.now(), threshold_seconds):
+        now = datetime.now()
+        if not is_stale_pipeline_outbox_item(subject, created_at, now, threshold_seconds):
             continue
 
-        age_seconds = (datetime.now() - created_at).total_seconds()
+        age_seconds = (now - created_at).total_seconds()
         logger.warning(
             "Deleting stale Outbox item left over from a previous run: subject=%r, age=%.0fs "
             "(threshold=%.0fs). It will not be sent - see that day's output folder for the "
@@ -190,6 +204,8 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
 
     outlook = win32com.client.Dispatch("Outlook.Application")
     namespace = outlook.GetNamespace("MAPI")
+    if cfg.email.outlook_profile:
+        namespace.Logon(cfg.email.outlook_profile)
     if namespace.Offline:
         raise RuntimeError(
             f"Outlook is in Work Offline mode - cannot send '{subject}'. Switch it to online "
@@ -214,9 +230,9 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
     # silently gone stale. Snapshot the Outbox's EntryIDs before/after Send() to identify the
     # freshly-queued copy (subject text alone isn't reliable - stale stuck items from past runs
     # can share the same subject), then poll for it to actually leave.
-    entry_ids_before = {item.EntryID for item in outbox.Items}
+    entry_ids_before = _outbox_entry_ids(outbox)
     mail.Send()
-    new_entry_ids = {item.EntryID for item in outbox.Items} - entry_ids_before
+    new_entry_ids = _outbox_entry_ids(outbox) - entry_ids_before
 
     if not new_entry_ids:
         logger.info("Confirmed '%s' left the Outbox immediately (transmitted) to %s", subject, cfg.email.to)
@@ -226,7 +242,7 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
     timeout = cfg.email.send_confirm_timeout_seconds
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        still_stuck = new_entry_ids & {item.EntryID for item in outbox.Items}
+        still_stuck = new_entry_ids & _outbox_entry_ids(outbox)
         if not still_stuck:
             logger.info("Confirmed '%s' left the Outbox (transmitted) to %s", subject, cfg.email.to)
             return

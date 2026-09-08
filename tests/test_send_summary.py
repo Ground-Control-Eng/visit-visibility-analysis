@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.send_summary import EMAIL_SUBJECT_PREFIX, is_stale_pipeline_outbox_item
+from src.send_summary import EMAIL_SUBJECT_PREFIX, _outbox_entry_ids, is_stale_pipeline_outbox_item
 
 SUBJECT = f"{EMAIL_SUBJECT_PREFIX} Summary - 2026-09-05"
 THRESHOLD = 3600
@@ -47,3 +47,24 @@ def test_naive_vs_aware_mismatch_raises_typeerror():
     created_at = datetime(2026, 9, 7, 10, 0, 0, tzinfo=timezone.utc)
     with pytest.raises(TypeError):
         is_stale_pipeline_outbox_item(SUBJECT, created_at, now, THRESHOLD)
+
+
+class _StubItem:
+    def __init__(self, entry_id):
+        self._entry_id = entry_id
+
+    @property
+    def EntryID(self):
+        if self._entry_id is None:
+            raise Exception("Outlook has already begun transmitting this message.")
+        return self._entry_id
+
+
+class _StubOutbox:
+    def __init__(self, items):
+        self.Items = items
+
+
+def test_outbox_entry_ids_skips_item_mid_transmission():
+    outbox = _StubOutbox([_StubItem("readable-1"), _StubItem(None), _StubItem("readable-2")])
+    assert _outbox_entry_ids(outbox) == {"readable-1", "readable-2"}

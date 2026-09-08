@@ -171,3 +171,7 @@ on its own, the next scheduled run would still find the same stuck item sitting 
 and someone had to clear it manually before a retry could succeed. This only clears the
 symptom (a blocked Outbox); if the underlying stale Exchange session keeps recurring, it
 still typically needs the interactive re-sign-in described above.
+
+Briefly being unable to read an Outbox item's properties (Outlook raises "already begun
+transmitting this message") is expected right as a message starts sending, and is handled
+gracefully - it's not itself a sign of a problem, just that the item is actively going out.

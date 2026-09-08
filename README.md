@@ -138,3 +138,40 @@ If Outlook itself is unreachable when a run fails (not signed in, or closed), th
 can't send its own failure-alert email through Outlook. In that case the failure is still
 recorded in `output/YYYY-MM-DD/run_log.txt` - check there if a day's summary email doesn't
 arrive at all.
+
+A second, easier-to-miss failure mode: `mail.Send()` only queues a message into Outlook's
+local Outbox - it does **not** confirm the message was actually transmitted, and it doesn't
+raise an exception even if Outlook's connection to Exchange has silently gone stale (e.g. a
+Modern Auth/MFA session that expired with no one present to re-authenticate it). Outlook can
+sit in this state indefinitely without reporting itself as "offline" - the only visible sign
+is that no new mail arrives in the Inbox either. Before this fix, that meant the log would
+say `Sent email '...'` while the message sat unsent in the Outbox forever.
+
+`_send_via_outlook()` (`src/send_summary.py`) now guards against this: it snapshots the
+Outbox before/after `Send()` to identify the freshly-queued item, forces an immediate
+Send/Receive, and polls for up to `email.send_confirm_timeout_seconds` (default 30s,
+`config.yaml`) for that item to actually leave the Outbox. If it's still stuck after the
+timeout, the run now fails loudly (non-zero exit, logged error, a failure-email attempt)
+instead of falsely logging success. If Outlook's connection has gone stale like this, it
+typically needs an interactive re-sign-in (closing and reopening Outlook, or completing an
+MFA prompt) - something only a person at the keyboard can do; there's no way around this in
+this scenario, so if the pipeline keeps failing this way, check whether Outlook needs to be
+reconnected.
+
+If a run *still* can't get a failure email out at all (Outlook fully unreachable), `main.py`
+still returns a non-zero exit code - check the Scheduled Task's "Last Run Result" in Task
+Scheduler as a backstop, alongside `run_log.txt`, if no email arrives and you're not sure why.
+
+On top of detecting a stuck send, every send attempt now also auto-deletes any leftover
+Outbox item matching this pipeline's subject prefix ("Visit Reconciliation...") that's older
+than `email.stale_outbox_cleanup_seconds` (default 1 hour, `config.yaml`), logging a warning
+with its subject and age. This means a prior run's stuck item no longer has to be deleted by
+hand before the next run can get its own email out - previously, if the connection recovered
+on its own, the next scheduled run would still find the same stuck item sitting in the Outbox
+and someone had to clear it manually before a retry could succeed. This only clears the
+symptom (a blocked Outbox); if the underlying stale Exchange session keeps recurring, it
+still typically needs the interactive re-sign-in described above.
+
+Briefly being unable to read an Outbox item's properties (Outlook raises "already begun
+transmitting this message") is expected right as a message starts sending, and is handled
+gracefully - it's not itself a sign of a problem, just that the item is actively going out.

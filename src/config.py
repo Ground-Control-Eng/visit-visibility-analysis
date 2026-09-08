@@ -50,6 +50,8 @@ class EmailConfig:
     cc: list
     send_on_success: bool
     send_on_failure: bool
+    send_confirm_timeout_seconds: float
+    stale_outbox_cleanup_seconds: float
 
 
 @dataclass
@@ -146,10 +148,22 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         cc=recipients_raw.get("cc", []),
         send_on_success=bool(email_raw.get("send_on_success", True)),
         send_on_failure=bool(email_raw.get("send_on_failure", True)),
+        send_confirm_timeout_seconds=float(email_raw.get("send_confirm_timeout_seconds", 30)),
+        stale_outbox_cleanup_seconds=float(email_raw.get("stale_outbox_cleanup_seconds", 3600)),
     )
 
     if not email.to:
         raise ConfigError("email.recipients.to must contain at least one recipient.")
+
+    if email.send_confirm_timeout_seconds <= 0:
+        raise ConfigError("email.send_confirm_timeout_seconds must be greater than 0.")
+
+    if email.stale_outbox_cleanup_seconds <= email.send_confirm_timeout_seconds:
+        raise ConfigError(
+            "email.stale_outbox_cleanup_seconds must be greater than send_confirm_timeout_seconds - "
+            "otherwise a message that just timed out in this run could be deleted as 'stale' before "
+            "it's had a real chance to be judged abandoned."
+        )
 
     run = RunConfig(
         output_dir=(PROJECT_ROOT / run_raw.get("output_dir", "./output")).resolve(),

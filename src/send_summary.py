@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from . import notify_teams
 from .config import Config
 from .reconcile import ALERT_ISSUE_TYPES, INFORMATIONAL_ISSUE_TYPES, RECONCILIATION_ACCOUNTING_TYPES
 
@@ -446,3 +447,9 @@ def send_failure_email(stage: str, exception: Exception, cfg: Config, run_date: 
             "Failure details are in the run log at %s.",
             log_path,
         )
+        teams_message = (
+            f"Stage: {stage}\nError: {type(exception).__name__}: {exception}\n"
+            f"Outlook could not send either the original alert or this failure notification - "
+            f"see {log_path} for full details."
+        )
+        notify_teams.send_teams_alert(subject, teams_message, cfg)

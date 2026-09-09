@@ -76,6 +76,15 @@ email:
   # send_confirm_timeout_seconds above - see README "Known limitation" for why).
   stale_outbox_cleanup_seconds: 3600
 
+notifications:
+  teams:
+    # Last-resort fallback: only used when Outlook can't send the failure-alert email either
+    # (see README "Known limitation"). One-time setup: in the target Teams channel, "..." >
+    # Workflows > "Post to a channel when a webhook request is received" > complete the wizard >
+    # paste the URL it gives you here. Leave null until set up - a missing URL just logs a
+    # warning instead of failing the run.
+    webhook_url: null
+
 hubscape_columns:
   # Confirmed against a real export (production_uncompleted_visits_*.csv). Hubscape only
   # exposes the API_ID it received via the Visits API - it never sees ICe2's own VisitID.

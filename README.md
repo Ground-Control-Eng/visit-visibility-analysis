@@ -29,6 +29,12 @@ This means:
 - If the refresh doesn't complete within `sql.visits_api_excel.refresh_timeout_seconds` (default
   180s), the run fails with a diagnostic error instead of hanging indefinitely.
 
+Optional: a Microsoft Teams fallback alert (see "Known limitation" below) for when Outlook can't
+send the failure-alert email either. To set it up, in the target Teams channel: "..." > Workflows
+> "Post to a channel when a webhook request is received" > complete the wizard > paste the URL it
+gives you into `notifications.teams.webhook_url` in `config.yaml`. Leave it `null` to skip this -
+it's optional and the run won't fail because it's unset.
+
 ## Configuration
 
 All settings live in `config.yaml` - no code changes needed to retune:
@@ -186,6 +192,22 @@ If a run *still* can't get a failure email out at all (Outlook fully unreachable
 still returns a non-zero exit code - check the Scheduled Task's "Last Run Result" in Task
 Scheduler as a backstop, alongside `run_log.txt` and the Event Log, if no email arrives and
 you're not sure why.
+
+A `700` (`olCachedConnectedDrizzle`) or other value outside the unambiguously-bad set above
+means Outlook *reports* itself connected, but this doesn't guarantee it's actually syncing -
+observed in practice: a session sat at `700` for several hours across multiple runs, with the
+Inbox never advancing either, and no Outbox send ever transmitting. Nothing server-side can
+distinguish this from a healthy-but-quiet mailbox in advance, so it's only caught by the
+Outbox-poll timeout above, same as any other stuck send - it just won't show up as an
+unambiguous `ExchangeConnectionMode` before the send is attempted.
+
+Because a failure like that also blocks the failure-alert email itself, `send_failure_email()`
+additionally posts to a Teams channel webhook (`notifications.teams.webhook_url` in
+`config.yaml` - see Setup above) whenever the Outlook send fails, via a plain HTTPS request
+(`src/notify_teams.py`) with no Outlook/COM involved - so there's still a notification path when
+Outlook is the thing that's broken. This is a fallback only: it doesn't fire on a normal
+successful run, and if the webhook itself isn't configured yet, it just logs a warning rather
+than blocking anything.
 
 On top of detecting a stuck send, every send attempt now also auto-deletes any leftover
 Outbox item matching this pipeline's subject prefix ("Visit Reconciliation...") that's older

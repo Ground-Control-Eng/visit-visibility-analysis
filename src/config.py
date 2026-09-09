@@ -56,6 +56,11 @@ class EmailConfig:
 
 
 @dataclass
+class TeamsConfig:
+    webhook_url: str | None
+
+
+@dataclass
 class RunConfig:
     output_dir: Path
     keep_days: int
@@ -76,6 +81,9 @@ class Config:
     email: EmailConfig
     hubscape_api_id_column: str
     run: RunConfig
+    # Trailing + defaulted so existing call sites (tests building a Config by hand) don't need
+    # to know about it - real runs get the loaded value from load_config() below regardless.
+    teams: TeamsConfig = field(default_factory=lambda: TeamsConfig(webhook_url=None))
 
 
 def _check_placeholder(value, path: str) -> None:
@@ -178,6 +186,9 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         test_mode=bool(run_raw.get("test_mode", True)),
     )
 
+    teams_raw = raw.get("notifications", {}).get("teams", {}) or {}
+    teams = TeamsConfig(webhook_url=teams_raw.get("webhook_url") or None)
+
     return Config(
         ice2=ice2,
         visits_api_excel=visits_api_excel,
@@ -192,5 +203,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         status_legend=statuses_raw.get("legend", {}),
         email=email,
         hubscape_api_id_column=hub_cols_raw.get("api_id_column", "External Visit API Id"),
+        teams=teams,
         run=run,
     )

@@ -14,6 +14,19 @@ from .reconcile import ALERT_ISSUE_TYPES, INFORMATIONAL_ISSUE_TYPES, RECONCILIAT
 logger = logging.getLogger("visit_reconciliation")
 
 _OUTLOOK_FOLDER_OUTBOX = 4  # olFolderOutbox
+_OUTLOOK_FOLDER_INBOX = 6  # olFolderInbox
+
+# OlExchangeConnectionMode values that unambiguously mean "not actually connected to Exchange"
+# (per Microsoft's OlExchangeConnectionMode enum). namespace.Offline only ever catches the two
+# "Offline" rows below - it stays False for a stale/disconnected Modern Auth session, which is
+# exactly the recurring failure mode this guards against (see README "Known limitation").
+_EXCHANGE_DISCONNECTED_MODES = {
+    0: "olNoExchange - this profile isn't on an Exchange account",
+    100: "olOffline - classic offline mode",
+    200: "olCachedOffline - Work Offline is selected",
+    300: "olDisconnected - disconnected from the Exchange server",
+    400: "olCachedDisconnected - cached mode, disconnected from the Exchange server",
+}
 
 EMAIL_SUBJECT_PREFIX = "Visit Reconciliation"
 
@@ -170,6 +183,49 @@ def _outbox_entry_ids(outbox) -> set[str]:
     return ids
 
 
+def _exchange_connection_problem(connection_mode: int) -> str | None:
+    """None if connection_mode looks healthy; otherwise a human-readable diagnosis. Note: a
+    value not in _EXCHANGE_DISCONNECTED_MODES ("looks connected") does NOT guarantee Outlook is
+    actually syncing - a stalled cached-mode session can still report e.g.
+    olCachedConnectedFull - see _send_via_outlook's Outbox-poll fallback for that case."""
+    return _EXCHANGE_DISCONNECTED_MODES.get(connection_mode)
+
+
+def _inbox_last_received(namespace) -> datetime | None:
+    """Best-effort read of the most recent Inbox ReceivedTime, or None on any failure (e.g. an
+    empty folder). An independent corroborating signal: a stale Exchange session can still
+    report a 'connected'-looking ExchangeConnectionMode while no new mail is actually
+    arriving."""
+    try:
+        inbox = namespace.GetDefaultFolder(_OUTLOOK_FOLDER_INBOX)
+        items = inbox.Items
+        items.Sort("[ReceivedTime]", True)
+        latest = items.GetFirst()
+        if latest is None:
+            return None
+        received_at = latest.ReceivedTime
+        return received_at.replace(tzinfo=None) if received_at.tzinfo else received_at
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _alert_via_event_log(message: str) -> None:
+    """Best-effort write to the Windows Application Event Log - a channel independent of
+    Outlook, so it still fires when Outlook itself is what's broken (see README "Known
+    limitation"). Requires the "Visit Reconciliation" event source to have been registered once
+    (scheduled_task/register_task.ps1, elevated) - if that hasn't been done, or the write fails
+    for any other reason, this just logs locally rather than masking the original error."""
+    try:
+        import win32evtlog  # noqa: PLC0415
+        import win32evtlogutil  # noqa: PLC0415
+
+        win32evtlogutil.ReportEvent(
+            "Visit Reconciliation", 1, eventType=win32evtlog.EVENTLOG_ERROR_TYPE, strings=[message],
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not write alert to the Windows Event Log either.")
+
+
 def _cleanup_stale_outbox_items(outbox, threshold_seconds: float) -> None:
     """Deletes leftover Outbox items from a previous failed run so they don't sit there
     indefinitely requiring manual cleanup before the next send can get through."""
@@ -206,14 +262,21 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
     namespace = outlook.GetNamespace("MAPI")
     if cfg.email.outlook_profile:
         namespace.Logon(cfg.email.outlook_profile)
-    if namespace.Offline:
-        raise RuntimeError(
-            f"Outlook is in Work Offline mode - cannot send '{subject}'. Switch it to online "
-            "(Send/Receive tab) and re-run."
+
+    connection_mode = namespace.ExchangeConnectionMode
+    problem = _exchange_connection_problem(connection_mode)
+    if problem:
+        diagnosis = (
+            f"Outlook is not connected to Exchange - cannot send '{subject}'. "
+            f"ExchangeConnectionMode={connection_mode} ({problem}). Sign in / reconnect "
+            "Outlook (Send/Receive tab, or close and reopen it) and re-run."
         )
+        _alert_via_event_log(diagnosis)
+        raise RuntimeError(diagnosis)
 
     outbox = namespace.GetDefaultFolder(_OUTLOOK_FOLDER_OUTBOX)
     _cleanup_stale_outbox_items(outbox, cfg.email.stale_outbox_cleanup_seconds)
+    inbox_before = _inbox_last_received(namespace)
 
     mail = outlook.CreateItem(0)  # olMailItem
     mail.To = "; ".join(cfg.email.to)
@@ -248,11 +311,18 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
             return
         time.sleep(2)
 
-    raise RuntimeError(
+    inbox_after = _inbox_last_received(namespace)
+    connection_mode_after = namespace.ExchangeConnectionMode
+    problem_after = _exchange_connection_problem(connection_mode_after) or "reports connected"
+    diagnosis = (
         f"Email '{subject}' is still sitting in the Outbox after {timeout:.0f}s - Outlook accepted "
-        "it but never transmitted it. Check Outlook is actually connected/signed in to Exchange "
-        "(e.g. no new mail arriving in the Inbox is a red flag, even if it doesn't report 'offline')."
+        f"it but never transmitted it. ExchangeConnectionMode={connection_mode_after} "
+        f"({problem_after}). Last Inbox mail received at {inbox_after} (was {inbox_before} before "
+        "this send attempt) - if that hasn't advanced, Outlook is not actually syncing with "
+        "Exchange despite not reporting itself offline; an interactive re-sign-in is required."
     )
+    _alert_via_event_log(diagnosis)
+    raise RuntimeError(diagnosis)
 
 
 def send_success_email(summary_df: pd.DataFrame, detail_df: pd.DataFrame, cfg: Config,

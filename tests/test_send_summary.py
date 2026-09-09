@@ -6,7 +6,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.send_summary import EMAIL_SUBJECT_PREFIX, _outbox_entry_ids, is_stale_pipeline_outbox_item
+from src.send_summary import (
+    EMAIL_SUBJECT_PREFIX,
+    _exchange_connection_problem,
+    _outbox_entry_ids,
+    is_stale_pipeline_outbox_item,
+)
 
 SUBJECT = f"{EMAIL_SUBJECT_PREFIX} Summary - 2026-09-05"
 THRESHOLD = 3600
@@ -68,3 +73,13 @@ class _StubOutbox:
 def test_outbox_entry_ids_skips_item_mid_transmission():
     outbox = _StubOutbox([_StubItem("readable-1"), _StubItem(None), _StubItem("readable-2")])
     assert _outbox_entry_ids(outbox) == {"readable-1", "readable-2"}
+
+
+@pytest.mark.parametrize("mode", [0, 100, 200, 300, 400])
+def test_disconnected_exchange_modes_are_flagged(mode):
+    assert _exchange_connection_problem(mode) is not None
+
+
+@pytest.mark.parametrize("mode", [500, 600, 700, 800])
+def test_connected_looking_exchange_modes_are_not_flagged(mode):
+    assert _exchange_connection_problem(mode) is None

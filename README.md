@@ -147,20 +147,45 @@ sit in this state indefinitely without reporting itself as "offline" - the only 
 is that no new mail arrives in the Inbox either. Before this fix, that meant the log would
 say `Sent email '...'` while the message sat unsent in the Outbox forever.
 
-`_send_via_outlook()` (`src/send_summary.py`) now guards against this: it snapshots the
-Outbox before/after `Send()` to identify the freshly-queued item, forces an immediate
-Send/Receive, and polls for up to `email.send_confirm_timeout_seconds` (default 30s,
-`config.yaml`) for that item to actually leave the Outbox. If it's still stuck after the
-timeout, the run now fails loudly (non-zero exit, logged error, a failure-email attempt)
-instead of falsely logging success. If Outlook's connection has gone stale like this, it
-typically needs an interactive re-sign-in (closing and reopening Outlook, or completing an
-MFA prompt) - something only a person at the keyboard can do; there's no way around this in
-this scenario, so if the pipeline keeps failing this way, check whether Outlook needs to be
-reconnected.
+`_send_via_outlook()` (`src/send_summary.py`) now guards against this on two levels:
+
+- Before attempting a send, it checks `Namespace.ExchangeConnectionMode` (not just
+  `Namespace.Offline`, which only ever catches a manual "Work Offline" toggle and stays
+  `False` for a stale/disconnected session). If the mode is unambiguously bad
+  (`olNoExchange`/`olOffline`/`olCachedOffline`/`olDisconnected`/`olCachedDisconnected`), it
+  fails immediately with that diagnosis instead of waiting out the full Outbox-poll timeout.
+- Otherwise, it snapshots the Outbox before/after `Send()` to identify the freshly-queued
+  item, forces an immediate Send/Receive, and polls for up to
+  `email.send_confirm_timeout_seconds` (default 30s, `config.yaml`) for that item to actually
+  leave the Outbox. A stuck-but-"connected"-looking session can be a transient blip that
+  self-recovers within seconds (observed in practice: a failure-alert for this exact timeout
+  transmitted instantly moments later), so this wait is retried up to
+  `email.send_confirm_retries` extra times (default 2, i.e. 3 attempts total) before giving
+  up - always re-polling the *same* queued item, never calling `Send()` again, so there's no
+  risk of a duplicate email going out. Only once every attempt has timed out does the
+  resulting error report `ExchangeConnectionMode` at that point and the Inbox's most-recent
+  `ReceivedTime` before vs. after the send attempt - operationalizing "no new mail arriving is
+  a red flag" into the error text itself, since a stalled cached-mode session can still report
+  a connected-looking mode.
+
+Either way the run now fails loudly (non-zero exit, logged error, a failure-email attempt)
+instead of falsely logging success, and a diagnostic entry is written to the Windows
+Application Event Log (source "Visit Reconciliation") - a channel independent of Outlook, so
+the alert still lands even if the failure-notification email itself can't send either. This
+requires the event source to have been registered once via an elevated
+`scheduled_task\register_task.ps1` run; if that hasn't been done, the write is skipped
+harmlessly (logged locally) rather than masking the original error.
+
+If Outlook's connection has gone stale like this, it typically needs an interactive
+re-sign-in (closing and reopening Outlook, or completing an MFA prompt) - something only a
+person at the keyboard can do; there's no way around this in this scenario, so if the
+pipeline keeps failing this way, check Event Viewer (Windows Logs > Application, source
+"Visit Reconciliation") or `run_log.txt` for the diagnosis, and reconnect Outlook.
 
 If a run *still* can't get a failure email out at all (Outlook fully unreachable), `main.py`
 still returns a non-zero exit code - check the Scheduled Task's "Last Run Result" in Task
-Scheduler as a backstop, alongside `run_log.txt`, if no email arrives and you're not sure why.
+Scheduler as a backstop, alongside `run_log.txt` and the Event Log, if no email arrives and
+you're not sure why.
 
 On top of detecting a stuck send, every send attempt now also auto-deletes any leftover
 Outbox item matching this pipeline's subject prefix ("Visit Reconciliation...") that's older

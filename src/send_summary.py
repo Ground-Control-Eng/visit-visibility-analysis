@@ -14,6 +14,19 @@ from .reconcile import ALERT_ISSUE_TYPES, INFORMATIONAL_ISSUE_TYPES, RECONCILIAT
 logger = logging.getLogger("visit_reconciliation")
 
 _OUTLOOK_FOLDER_OUTBOX = 4  # olFolderOutbox
+_OUTLOOK_FOLDER_INBOX = 6  # olFolderInbox
+
+# OlExchangeConnectionMode values that unambiguously mean "not actually connected to Exchange"
+# (per Microsoft's OlExchangeConnectionMode enum). namespace.Offline only ever catches the two
+# "Offline" rows below - it stays False for a stale/disconnected Modern Auth session, which is
+# exactly the recurring failure mode this guards against (see README "Known limitation").
+_EXCHANGE_DISCONNECTED_MODES = {
+    0: "olNoExchange - this profile isn't on an Exchange account",
+    100: "olOffline - classic offline mode",
+    200: "olCachedOffline - Work Offline is selected",
+    300: "olDisconnected - disconnected from the Exchange server",
+    400: "olCachedDisconnected - cached mode, disconnected from the Exchange server",
+}
 
 EMAIL_SUBJECT_PREFIX = "Visit Reconciliation"
 
@@ -170,6 +183,61 @@ def _outbox_entry_ids(outbox) -> set[str]:
     return ids
 
 
+def _exchange_connection_problem(connection_mode: int) -> str | None:
+    """None if connection_mode looks healthy; otherwise a human-readable diagnosis. Note: a
+    value not in _EXCHANGE_DISCONNECTED_MODES ("looks connected") does NOT guarantee Outlook is
+    actually syncing - a stalled cached-mode session can still report e.g.
+    olCachedConnectedFull - see _send_via_outlook's Outbox-poll fallback for that case."""
+    return _EXCHANGE_DISCONNECTED_MODES.get(connection_mode)
+
+
+def _read_exchange_connection_mode(namespace) -> int | None:
+    """Best-effort read of namespace.ExchangeConnectionMode - None if the COM property access
+    itself fails (e.g. a transient COM error), so a read failure degrades to 'inconclusive'
+    rather than raising a secondary exception that would mask the real diagnosis and skip the
+    Event Log alert."""
+    try:
+        return namespace.ExchangeConnectionMode
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not read namespace.ExchangeConnectionMode.", exc_info=True)
+        return None
+
+
+def _inbox_last_received(namespace) -> datetime | None:
+    """Best-effort read of the most recent Inbox ReceivedTime, or None on any failure (e.g. an
+    empty folder). An independent corroborating signal: a stale Exchange session can still
+    report a 'connected'-looking ExchangeConnectionMode while no new mail is actually
+    arriving."""
+    try:
+        inbox = namespace.GetDefaultFolder(_OUTLOOK_FOLDER_INBOX)
+        items = inbox.Items
+        items.Sort("[ReceivedTime]", True)
+        latest = items.GetFirst()
+        if latest is None:
+            return None
+        received_at = latest.ReceivedTime
+        return received_at.replace(tzinfo=None) if received_at.tzinfo else received_at
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _alert_via_event_log(message: str) -> None:
+    """Best-effort write to the Windows Application Event Log - a channel independent of
+    Outlook, so it still fires when Outlook itself is what's broken (see README "Known
+    limitation"). Requires the "Visit Reconciliation" event source to have been registered once
+    (scheduled_task/register_task.ps1, elevated) - if that hasn't been done, or the write fails
+    for any other reason, this just logs locally rather than masking the original error."""
+    try:
+        import win32evtlog  # noqa: PLC0415
+        import win32evtlogutil  # noqa: PLC0415
+
+        win32evtlogutil.ReportEvent(
+            "Visit Reconciliation", 1, eventType=win32evtlog.EVENTLOG_ERROR_TYPE, strings=[message],
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not write alert to the Windows Event Log either.")
+
+
 def _cleanup_stale_outbox_items(outbox, threshold_seconds: float) -> None:
     """Deletes leftover Outbox items from a previous failed run so they don't sit there
     indefinitely requiring manual cleanup before the next send can get through."""
@@ -206,14 +274,21 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
     namespace = outlook.GetNamespace("MAPI")
     if cfg.email.outlook_profile:
         namespace.Logon(cfg.email.outlook_profile)
-    if namespace.Offline:
-        raise RuntimeError(
-            f"Outlook is in Work Offline mode - cannot send '{subject}'. Switch it to online "
-            "(Send/Receive tab) and re-run."
+
+    connection_mode = _read_exchange_connection_mode(namespace)
+    problem = _exchange_connection_problem(connection_mode) if connection_mode is not None else None
+    if problem:
+        diagnosis = (
+            f"Outlook is not connected to Exchange - cannot send '{subject}'. "
+            f"ExchangeConnectionMode={connection_mode} ({problem}). Sign in / reconnect "
+            "Outlook (Send/Receive tab, or close and reopen it) and re-run."
         )
+        _alert_via_event_log(diagnosis)
+        raise RuntimeError(diagnosis)
 
     outbox = namespace.GetDefaultFolder(_OUTLOOK_FOLDER_OUTBOX)
     _cleanup_stale_outbox_items(outbox, cfg.email.stale_outbox_cleanup_seconds)
+    inbox_before = _inbox_last_received(namespace)
 
     mail = outlook.CreateItem(0)  # olMailItem
     mail.To = "; ".join(cfg.email.to)
@@ -238,21 +313,56 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
         logger.info("Confirmed '%s' left the Outbox immediately (transmitted) to %s", subject, cfg.email.to)
         return
 
-    namespace.SendAndReceive(False)  # force transmission now rather than waiting on Outlook's timer
-    timeout = cfg.email.send_confirm_timeout_seconds
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        still_stuck = new_entry_ids & _outbox_entry_ids(outbox)
-        if not still_stuck:
-            logger.info("Confirmed '%s' left the Outbox (transmitted) to %s", subject, cfg.email.to)
-            return
-        time.sleep(2)
+    if _confirm_outbox_transmit(namespace, outbox, subject, new_entry_ids, cfg):
+        return
 
-    raise RuntimeError(
-        f"Email '{subject}' is still sitting in the Outbox after {timeout:.0f}s - Outlook accepted "
-        "it but never transmitted it. Check Outlook is actually connected/signed in to Exchange "
-        "(e.g. no new mail arriving in the Inbox is a red flag, even if it doesn't report 'offline')."
+    total_attempts = cfg.email.send_confirm_retries + 1
+    inbox_after = _inbox_last_received(namespace)
+    connection_mode_after = _read_exchange_connection_mode(namespace)
+    if connection_mode_after is None:
+        mode_str = "unknown"
+        problem_after = "could not be determined - reading ExchangeConnectionMode failed"
+    else:
+        mode_str = str(connection_mode_after)
+        problem_after = _exchange_connection_problem(connection_mode_after) or "reports connected"
+    diagnosis = (
+        f"Email '{subject}' is still sitting in the Outbox after {total_attempts} attempt(s) of "
+        f"{cfg.email.send_confirm_timeout_seconds:.0f}s each - Outlook accepted it but never "
+        f"transmitted it. ExchangeConnectionMode={mode_str} ({problem_after}). Last Inbox mail "
+        f"received at {inbox_after} (was {inbox_before} before this send attempt) - if that "
+        "hasn't advanced, Outlook is not actually syncing with Exchange despite not reporting "
+        "itself offline; an interactive re-sign-in is required."
     )
+    _alert_via_event_log(diagnosis)
+    raise RuntimeError(diagnosis)
+
+
+def _confirm_outbox_transmit(namespace, outbox, subject: str, new_entry_ids: set[str], cfg: Config) -> bool:
+    """Polls for new_entry_ids to leave the Outbox, retrying the wait (never a second Send() -
+    so there's no risk of a duplicate email) up to cfg.email.send_confirm_retries extra times if
+    it's still stuck. A transient Exchange blip can self-recover within seconds - observed
+    2026-09-09: a failure-alert for this exact timeout transmitted instantly moments later - so
+    it's worth riding out a couple of retries before giving up and alerting."""
+    attempts = cfg.email.send_confirm_retries + 1
+    for attempt in range(1, attempts + 1):
+        namespace.SendAndReceive(False)  # force transmission now rather than waiting on Outlook's timer
+        deadline = time.monotonic() + cfg.email.send_confirm_timeout_seconds
+        while time.monotonic() < deadline:
+            still_stuck = new_entry_ids & _outbox_entry_ids(outbox)
+            if not still_stuck:
+                logger.info(
+                    "Confirmed '%s' left the Outbox (transmitted) to %s%s",
+                    subject, cfg.email.to, f" on attempt {attempt}/{attempts}" if attempt > 1 else "",
+                )
+                return True
+            time.sleep(2)
+        if attempt < attempts:
+            logger.warning(
+                "'%s' still in Outbox after %.0fs (attempt %d/%d) - retrying the wait rather than "
+                "giving up immediately.",
+                subject, cfg.email.send_confirm_timeout_seconds, attempt, attempts,
+            )
+    return False
 
 
 def send_success_email(summary_df: pd.DataFrame, detail_df: pd.DataFrame, cfg: Config,

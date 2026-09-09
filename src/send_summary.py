@@ -191,6 +191,18 @@ def _exchange_connection_problem(connection_mode: int) -> str | None:
     return _EXCHANGE_DISCONNECTED_MODES.get(connection_mode)
 
 
+def _read_exchange_connection_mode(namespace) -> int | None:
+    """Best-effort read of namespace.ExchangeConnectionMode - None if the COM property access
+    itself fails (e.g. a transient COM error), so a read failure degrades to 'inconclusive'
+    rather than raising a secondary exception that would mask the real diagnosis and skip the
+    Event Log alert."""
+    try:
+        return namespace.ExchangeConnectionMode
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not read namespace.ExchangeConnectionMode.", exc_info=True)
+        return None
+
+
 def _inbox_last_received(namespace) -> datetime | None:
     """Best-effort read of the most recent Inbox ReceivedTime, or None on any failure (e.g. an
     empty folder). An independent corroborating signal: a stale Exchange session can still
@@ -263,8 +275,8 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
     if cfg.email.outlook_profile:
         namespace.Logon(cfg.email.outlook_profile)
 
-    connection_mode = namespace.ExchangeConnectionMode
-    problem = _exchange_connection_problem(connection_mode)
+    connection_mode = _read_exchange_connection_mode(namespace)
+    problem = _exchange_connection_problem(connection_mode) if connection_mode is not None else None
     if problem:
         diagnosis = (
             f"Outlook is not connected to Exchange - cannot send '{subject}'. "
@@ -301,28 +313,56 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
         logger.info("Confirmed '%s' left the Outbox immediately (transmitted) to %s", subject, cfg.email.to)
         return
 
-    namespace.SendAndReceive(False)  # force transmission now rather than waiting on Outlook's timer
-    timeout = cfg.email.send_confirm_timeout_seconds
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        still_stuck = new_entry_ids & _outbox_entry_ids(outbox)
-        if not still_stuck:
-            logger.info("Confirmed '%s' left the Outbox (transmitted) to %s", subject, cfg.email.to)
-            return
-        time.sleep(2)
+    if _confirm_outbox_transmit(namespace, outbox, subject, new_entry_ids, cfg):
+        return
 
+    total_attempts = cfg.email.send_confirm_retries + 1
     inbox_after = _inbox_last_received(namespace)
-    connection_mode_after = namespace.ExchangeConnectionMode
-    problem_after = _exchange_connection_problem(connection_mode_after) or "reports connected"
+    connection_mode_after = _read_exchange_connection_mode(namespace)
+    if connection_mode_after is None:
+        mode_str = "unknown"
+        problem_after = "could not be determined - reading ExchangeConnectionMode failed"
+    else:
+        mode_str = str(connection_mode_after)
+        problem_after = _exchange_connection_problem(connection_mode_after) or "reports connected"
     diagnosis = (
-        f"Email '{subject}' is still sitting in the Outbox after {timeout:.0f}s - Outlook accepted "
-        f"it but never transmitted it. ExchangeConnectionMode={connection_mode_after} "
-        f"({problem_after}). Last Inbox mail received at {inbox_after} (was {inbox_before} before "
-        "this send attempt) - if that hasn't advanced, Outlook is not actually syncing with "
-        "Exchange despite not reporting itself offline; an interactive re-sign-in is required."
+        f"Email '{subject}' is still sitting in the Outbox after {total_attempts} attempt(s) of "
+        f"{cfg.email.send_confirm_timeout_seconds:.0f}s each - Outlook accepted it but never "
+        f"transmitted it. ExchangeConnectionMode={mode_str} ({problem_after}). Last Inbox mail "
+        f"received at {inbox_after} (was {inbox_before} before this send attempt) - if that "
+        "hasn't advanced, Outlook is not actually syncing with Exchange despite not reporting "
+        "itself offline; an interactive re-sign-in is required."
     )
     _alert_via_event_log(diagnosis)
     raise RuntimeError(diagnosis)
+
+
+def _confirm_outbox_transmit(namespace, outbox, subject: str, new_entry_ids: set[str], cfg: Config) -> bool:
+    """Polls for new_entry_ids to leave the Outbox, retrying the wait (never a second Send() -
+    so there's no risk of a duplicate email) up to cfg.email.send_confirm_retries extra times if
+    it's still stuck. A transient Exchange blip can self-recover within seconds - observed
+    2026-09-09: a failure-alert for this exact timeout transmitted instantly moments later - so
+    it's worth riding out a couple of retries before giving up and alerting."""
+    attempts = cfg.email.send_confirm_retries + 1
+    for attempt in range(1, attempts + 1):
+        namespace.SendAndReceive(False)  # force transmission now rather than waiting on Outlook's timer
+        deadline = time.monotonic() + cfg.email.send_confirm_timeout_seconds
+        while time.monotonic() < deadline:
+            still_stuck = new_entry_ids & _outbox_entry_ids(outbox)
+            if not still_stuck:
+                logger.info(
+                    "Confirmed '%s' left the Outbox (transmitted) to %s%s",
+                    subject, cfg.email.to, f" on attempt {attempt}/{attempts}" if attempt > 1 else "",
+                )
+                return True
+            time.sleep(2)
+        if attempt < attempts:
+            logger.warning(
+                "'%s' still in Outbox after %.0fs (attempt %d/%d) - retrying the wait rather than "
+                "giving up immediately.",
+                subject, cfg.email.send_confirm_timeout_seconds, attempt, attempts,
+            )
+    return False
 
 
 def send_success_email(summary_df: pd.DataFrame, detail_df: pd.DataFrame, cfg: Config,

@@ -157,11 +157,16 @@ say `Sent email '...'` while the message sat unsent in the Outbox forever.
 - Otherwise, it snapshots the Outbox before/after `Send()` to identify the freshly-queued
   item, forces an immediate Send/Receive, and polls for up to
   `email.send_confirm_timeout_seconds` (default 30s, `config.yaml`) for that item to actually
-  leave the Outbox. If it's still stuck after the timeout, the resulting error also reports
-  `ExchangeConnectionMode` at that point and the Inbox's most-recent `ReceivedTime` before vs.
-  after the send attempt - operationalizing "no new mail arriving is a red flag" into the
-  error text itself, since a stalled cached-mode session can still report a
-  connected-looking mode.
+  leave the Outbox. A stuck-but-"connected"-looking session can be a transient blip that
+  self-recovers within seconds (observed in practice: a failure-alert for this exact timeout
+  transmitted instantly moments later), so this wait is retried up to
+  `email.send_confirm_retries` extra times (default 2, i.e. 3 attempts total) before giving
+  up - always re-polling the *same* queued item, never calling `Send()` again, so there's no
+  risk of a duplicate email going out. Only once every attempt has timed out does the
+  resulting error report `ExchangeConnectionMode` at that point and the Inbox's most-recent
+  `ReceivedTime` before vs. after the send attempt - operationalizing "no new mail arriving is
+  a red flag" into the error text itself, since a stalled cached-mode session can still report
+  a connected-looking mode.
 
 Either way the run now fails loudly (non-zero exit, logged error, a failure-email attempt)
 instead of falsely logging success, and a diagnostic entry is written to the Windows

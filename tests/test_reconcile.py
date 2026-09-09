@@ -38,7 +38,7 @@ def make_cfg() -> Config:
                 lookback_hours=30, attachment_name_pattern="production_uncompleted_visits_*.csv",
             ),
             to=["alex.clark@ground-control.co.uk"], cc=[], send_on_success=True, send_on_failure=True,
-            send_confirm_timeout_seconds=30, stale_outbox_cleanup_seconds=3600,
+            send_confirm_timeout_seconds=30, send_confirm_retries=2, stale_outbox_cleanup_seconds=3600,
         ),
         hubscape_api_id_column="External Visit API Id",
         run=RunConfig(output_dir=Path("./output"), keep_days=90, test_mode=True),

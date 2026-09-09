@@ -67,6 +67,10 @@ email:
   # before treating the send as failed (mail.Send() alone doesn't confirm transmission - see
   # the "Known limitation" section in README.md).
   send_confirm_timeout_seconds: 30
+  # How many extra times to retry that wait (same queued item, never a second Send() - so no
+  # duplicate-email risk) if it's still stuck, before giving up and alerting. A transient
+  # Exchange blip can self-recover within seconds - see "Known limitation" in README.md.
+  send_confirm_retries: 2
   # How old a leftover Outbox item matching this pipeline's subject prefix must be before it's
   # treated as an orphan from a previous failed run and auto-deleted (kept separate from
   # send_confirm_timeout_seconds above - see README "Known limitation" for why).

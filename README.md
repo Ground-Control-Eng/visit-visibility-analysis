@@ -9,6 +9,16 @@ mapped copy), and Hubscape (what delivery teams see, active visits only).
 pip install -r requirements.txt
 ```
 
+This pipeline requires **Classic Outlook**, not New Outlook, on the machine running it.
+`src/send_summary.py` and `src/fetch_email.py` both automate Outlook via COM (the classic
+Outlook Object Model - `win32com.client.Dispatch("Outlook.Application")`). New Outlook doesn't
+support this: Microsoft has confirmed New Outlook has no COM/Object-Model automation and no
+VBA/VSTO/COM add-in support, so there's no `Outlook.Application` COM server for it to `Dispatch()`
+against. The only supported programmatic path for a New-Outlook-era mailbox is Microsoft Graph
+API, which would be a genuine replatform, not a config change - out of scope unless a future
+change decides to take that on. Until then, keep Classic Outlook installed and set as the
+default mail handler for the account the Scheduled Task runs as.
+
 The ICe2 connection (`GCV-PROD-SQL01`) uses Windows-integrated auth and needs no setup.
 
 The Visits API data (Azure SQL, `sql-gc-services-prod.database.windows.net`) is **not** queried
@@ -153,7 +163,14 @@ say `Sent email '...'` while the message sat unsent in the Outbox forever.
   `Namespace.Offline`, which only ever catches a manual "Work Offline" toggle and stays
   `False` for a stale/disconnected session). If the mode is unambiguously bad
   (`olNoExchange`/`olOffline`/`olCachedOffline`/`olDisconnected`/`olCachedDisconnected`), it
-  fails immediately with that diagnosis instead of waiting out the full Outbox-poll timeout.
+  first tries a best-effort reconnect nudge (`_attempt_reconnect()`: re-issues
+  `Namespace.Logon` and forces a `Namespace.SendAndReceive`, then re-checks the connection mode
+  for up to `email.send_confirm_timeout_seconds`) before giving up. This is what actually
+  prompts Outlook's own identity module to either silently refresh an expiring token (a
+  transient blip that self-recovers) or surface its own sign-in prompt for whoever's at the
+  machine to complete - it does **not** and cannot complete an MFA challenge itself, so a truly
+  expired session still requires a person at the keyboard. Only if the mode is still bad after
+  the nudge does it fail with that diagnosis instead of waiting out the full Outbox-poll timeout.
 - Otherwise, it snapshots the Outbox before/after `Send()` to identify the freshly-queued
   item, forces an immediate Send/Receive, and polls for up to
   `email.send_confirm_timeout_seconds` (default 30s, `config.yaml`) for that item to actually

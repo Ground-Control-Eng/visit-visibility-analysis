@@ -11,6 +11,7 @@ from src import send_summary
 from src.send_summary import (
     EMAIL_SUBJECT_PREFIX,
     _alert_via_event_log,
+    _attempt_reconnect,
     _confirm_outbox_transmit,
     _exchange_connection_problem,
     _inbox_last_received,
@@ -241,3 +242,71 @@ def test_confirm_outbox_transmit_gives_up_after_retries_exhausted(monkeypatch):
 
     assert _confirm_outbox_transmit(namespace, outbox, "subj", {"id-1"}, _make_cfg(5, 2)) is False
     assert namespace.send_and_receive_calls == 3  # 1 initial attempt + 2 retries
+
+
+class _StubReconnectNamespace:
+    """ExchangeConnectionMode is a function of how many SendAndReceive calls have happened so
+    far, so tests can simulate the connection clearing up right after the forced nudge."""
+
+    def __init__(self, mode_by_send_and_receive_calls):
+        self.logon_calls = 0
+        self.send_and_receive_calls = 0
+        self._mode_by_calls = mode_by_send_and_receive_calls
+
+    def Logon(self, *_args):
+        self.logon_calls += 1
+
+    def SendAndReceive(self, _sync):
+        self.send_and_receive_calls += 1
+
+    @property
+    def ExchangeConnectionMode(self):
+        return self._mode_by_calls(self.send_and_receive_calls)
+
+
+def test_attempt_reconnect_recovers_after_the_nudge(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
+    namespace = _StubReconnectNamespace(lambda calls: 500 if calls >= 1 else 400)
+
+    assert _attempt_reconnect(namespace, wait_seconds=10) == 500
+    assert namespace.logon_calls == 1
+    assert namespace.send_and_receive_calls == 1
+
+
+def test_attempt_reconnect_gives_up_after_wait_seconds_if_still_bad(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
+    namespace = _StubReconnectNamespace(lambda _calls: 400)
+
+    assert _attempt_reconnect(namespace, wait_seconds=5) == 400
+
+
+def test_attempt_reconnect_swallows_logon_failure(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
+
+    class _RaisingLogonNamespace(_StubReconnectNamespace):
+        def Logon(self, *_args):
+            raise Exception("You are already logged on.")
+
+    namespace = _RaisingLogonNamespace(lambda calls: 500 if calls >= 1 else 400)
+
+    assert _attempt_reconnect(namespace, wait_seconds=10) == 500
+
+
+def test_attempt_reconnect_swallows_send_and_receive_failure(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
+
+    class _RaisingSendReceiveNamespace(_StubReconnectNamespace):
+        def SendAndReceive(self, _sync):
+            raise Exception("boom")
+
+    namespace = _RaisingSendReceiveNamespace(lambda _calls: 400)
+
+    assert _attempt_reconnect(namespace, wait_seconds=5) == 400

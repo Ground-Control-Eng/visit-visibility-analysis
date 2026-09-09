@@ -267,6 +267,35 @@ def _cleanup_stale_outbox_items(outbox, threshold_seconds: float) -> None:
             logger.exception("Failed to delete stale Outbox item with subject=%r.", subject)
 
 
+def _attempt_reconnect(namespace, wait_seconds: float) -> int | None:
+    """Best-effort nudge to clear a stale Exchange connection before giving up: re-issues
+    Namespace.Logon (a no-op if a MAPI session is already active - harmless either way) and
+    forces a Send/Receive, which is what actually prompts Outlook's own identity module to
+    either silently refresh an expiring token (the "transient blip" case - see README "Known
+    limitation") or surface its own sign-in UI for whoever's at the machine to complete. Neither
+    outcome is guaranteed - no script can complete an MFA challenge on a person's behalf - so
+    this never raises; callers re-check the returned connection mode themselves."""
+    try:
+        namespace.Logon("", "", True, False)
+    except Exception:  # noqa: BLE001
+        logger.debug("Namespace.Logon reconnect nudge failed (often harmless if already logged on).", exc_info=True)
+    try:
+        namespace.SendAndReceive(True)
+    except Exception:  # noqa: BLE001
+        logger.debug("SendAndReceive reconnect nudge failed.", exc_info=True)
+
+    deadline = time.monotonic() + wait_seconds
+    connection_mode = _read_exchange_connection_mode(namespace)
+    while (
+        connection_mode is not None
+        and _exchange_connection_problem(connection_mode) is not None
+        and time.monotonic() < deadline
+    ):
+        time.sleep(2)
+        connection_mode = _read_exchange_connection_mode(namespace)
+    return connection_mode
+
+
 def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: list[Path]) -> None:
     import win32com.client  # noqa: PLC0415
 
@@ -278,10 +307,20 @@ def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: li
     connection_mode = _read_exchange_connection_mode(namespace)
     problem = _exchange_connection_problem(connection_mode) if connection_mode is not None else None
     if problem:
+        logger.warning(
+            "ExchangeConnectionMode=%s (%s) before sending '%s' - attempting a reconnect nudge "
+            "(Logon + forced Send/Receive) before giving up.",
+            connection_mode, problem, subject,
+        )
+        connection_mode = _attempt_reconnect(namespace, cfg.email.send_confirm_timeout_seconds)
+        problem = _exchange_connection_problem(connection_mode) if connection_mode is not None else None
+
+    if problem:
         diagnosis = (
             f"Outlook is not connected to Exchange - cannot send '{subject}'. "
-            f"ExchangeConnectionMode={connection_mode} ({problem}). Sign in / reconnect "
-            "Outlook (Send/Receive tab, or close and reopen it) and re-run."
+            f"ExchangeConnectionMode={connection_mode} ({problem}). A reconnect nudge (forced "
+            "Send/Receive) didn't clear it - sign in / reconnect Outlook (Send/Receive tab, or "
+            "close and reopen it) and re-run."
         )
         _alert_via_event_log(diagnosis)
         raise RuntimeError(diagnosis)

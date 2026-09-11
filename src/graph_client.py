@@ -53,7 +53,17 @@ def acquire_token(cfg: Config, *, force_refresh: bool = False) -> str:
 
     MSAL's in-memory cache transparently reuses the token across the fetch + send calls within
     one run - this only makes a real token request once per process under normal conditions.
+
+    The client secret is checked here rather than at config-load time, so an offline
+    --dry-run-email-path run (which never touches Graph) doesn't need a .env file at all.
     """
+    if not cfg.graph.client_secret:
+        raise GraphAuthError(
+            "GRAPH_CLIENT_SECRET environment variable is not set. Copy .env.example to .env "
+            "(in the project root) and fill in the real client secret from the Entra ID app "
+            "registration, or set GRAPH_CLIENT_SECRET as a real environment variable."
+        )
+
     app = _get_msal_app(cfg)
     if force_refresh:
         # MSAL has no direct "drop this token" call for the client-credentials flow - removing
@@ -80,33 +90,57 @@ def _parse_graph_error(response: requests.Response) -> tuple[str | None, str | N
 
 
 def _request_with_retry(method: str, url: str, cfg: Config, **kwargs) -> requests.Response:
-    max_attempts = cfg.graph.max_retries + 1
+    """Retries retryable HTTP statuses (429/5xx) and transport-level failures (DNS/timeout/
+    connection errors) up to cfg.graph.max_retries times, with backoff. The one-time 401
+    forced-token-refresh retry is tracked separately (did_401_refresh) so it always gets to run
+    once even when max_retries is 0 - it's a distinct concern (a possibly-stale cached token),
+    not an ordinary transient-failure retry."""
+    max_retries = cfg.graph.max_retries
+    retries_used = 0
+    did_401_refresh = False
     force_refresh = False
     last_response: requests.Response | None = None
+    request_kwargs = dict(kwargs)
 
-    for attempt in range(1, max_attempts + 1):
+    while True:
         token = acquire_token(cfg, force_refresh=force_refresh)
         force_refresh = False
-        headers = kwargs.pop("headers", {}) or {}
+        headers = request_kwargs.pop("headers", {}) or {}
         headers["Authorization"] = f"Bearer {token}"
 
-        response = requests.request(
-            method, url, headers=headers, timeout=cfg.graph.request_timeout_seconds, **kwargs,
-        )
-        if response.ok:
+        try:
+            response = requests.request(
+                method, url, headers=headers, timeout=cfg.graph.request_timeout_seconds,
+                **request_kwargs,
+            )
+        except requests.RequestException as exc:
+            if retries_used < max_retries:
+                retries_used += 1
+                wait_seconds = min(2 ** (retries_used - 1), 30)
+                logger.warning(
+                    "Graph request to %s failed (%s) - retrying in %.0fs (%d/%d).",
+                    url, exc, wait_seconds, retries_used, max_retries,
+                )
+                time.sleep(wait_seconds)
+                continue
+            raise GraphApiError(0, "RequestException", str(exc)) from exc
+
+        if 200 <= response.status_code < 300:
             return response
 
         last_response = response
-        if response.status_code == 401 and attempt == 1:
+        if response.status_code == 401 and not did_401_refresh:
+            did_401_refresh = True
             logger.warning("Graph API returned 401 - forcing a token refresh and retrying once.")
             force_refresh = True
             continue
-        if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_attempts:
+        if response.status_code in _RETRYABLE_STATUS_CODES and retries_used < max_retries:
+            retries_used += 1
             retry_after = response.headers.get("Retry-After")
-            wait_seconds = float(retry_after) if retry_after else min(2 ** (attempt - 1), 30)
+            wait_seconds = float(retry_after) if retry_after else min(2 ** (retries_used - 1), 30)
             logger.warning(
-                "Graph API returned %d on attempt %d/%d - retrying in %.0fs.",
-                response.status_code, attempt, max_attempts, wait_seconds,
+                "Graph API returned %d - retrying in %.0fs (%d/%d).",
+                response.status_code, wait_seconds, retries_used, max_retries,
             )
             time.sleep(wait_seconds)
             continue
@@ -127,3 +161,18 @@ def graph_get(path: str, cfg: Config, params: dict | None = None) -> dict:
 
 def graph_post(path: str, cfg: Config, json_body: dict) -> requests.Response:
     return _request_with_retry("POST", _resolve_url(path), cfg, json=json_body)
+
+
+def graph_get_pages(path: str, cfg: Config, params: dict | None = None):
+    """Yields each page's response dict from a Graph list endpoint, following @odata.nextLink
+    until the collection is exhausted. The first request uses `params`; subsequent requests use
+    the full next-link URL as-is (it already encodes the original query). Callers that want a
+    bounded search (e.g. a page-count cap) should break out of the loop themselves - this
+    generator doesn't limit how many pages it will fetch."""
+    next_path: str | None = path
+    page = 0
+    while next_path:
+        page += 1
+        resp = graph_get(next_path, cfg, params=params if page == 1 else None)
+        yield resp
+        next_path = resp.get("@odata.nextLink")

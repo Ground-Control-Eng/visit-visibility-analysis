@@ -21,6 +21,21 @@ class AttachmentNotFoundError(Exception):
     pass
 
 
+def _parse_graph_datetime(value: str) -> datetime:
+    """Parses a Graph DateTimeOffset string (always UTC, "Z"-suffixed) into an aware UTC
+    datetime. Graph commonly includes fractional seconds of varying precision (e.g.
+    "2026-09-10T10:00:00.1234567Z"), which a fixed-format strptime("%Y-%m-%dT%H:%M:%SZ") can't
+    parse - normalize the fractional part to exactly 6 digits (Python's %f) before parsing."""
+    value = value.rstrip("Z")
+    if "." in value:
+        base, frac = value.split(".", 1)
+        frac = (frac + "000000")[:6]
+        parsed = datetime.strptime(f"{base}.{frac}", "%Y-%m-%dT%H:%M:%S.%f")
+    else:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S")
+    return parsed.replace(tzinfo=timezone.utc)
+
+
 def _resolve_folder_id(cfg: Config, folder_path: str) -> str:
     """Maps a "Inbox" / "Inbox/Subfolder" style path to a Graph mail folder id, walking
     childFolders by displayName one segment at a time. "Inbox" (or blank) resolves to the
@@ -65,19 +80,16 @@ def find_todays_hubscape_email(cfg: Config, now: datetime | None = None) -> dict
         "$top": cfg.graph.mail_search_page_size,
         "$select": "id,receivedDateTime,subject,from,hasAttachments",
     }
+    path = f"/users/{cfg.graph.mailbox}/mailFolders/{folder_id}/messages"
 
     matches = []
-    path: str | None = f"/users/{cfg.graph.mailbox}/mailFolders/{folder_id}/messages"
-    page = 0
     stop = False
-    while path and not stop and page < cfg.graph.mail_search_max_pages:
-        page += 1
-        resp = graph_client.graph_get(path, cfg, params=params if page == 1 else None)
-
+    truncated = False
+    pages_seen = 0
+    for resp in graph_client.graph_get_pages(path, cfg, params=params):
+        pages_seen += 1
         for msg in resp.get("value", []):
-            received = datetime.strptime(msg["receivedDateTime"], "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=timezone.utc
-            )
+            received = _parse_graph_datetime(msg["receivedDateTime"])
             if received < cutoff:
                 stop = True  # sorted descending, nothing older (here or on later pages) will match
                 break
@@ -94,9 +106,32 @@ def find_todays_hubscape_email(cfg: Config, now: datetime | None = None) -> dict
             if sender_ok and subject_ok:
                 matches.append(msg)
 
-        path = resp.get("@odata.nextLink")
+        if stop:
+            break
+        if pages_seen >= cfg.graph.mail_search_max_pages:
+            if resp.get("@odata.nextLink"):
+                # More results existed beyond graph.mail_search_max_pages and we never reached
+                # the lookback cutoff - this search was bounded, not exhausted. Surface that
+                # distinction rather than reporting it identically to a genuine no-match.
+                truncated = True
+            break
 
     if not matches:
+        if truncated:
+            logger.warning(
+                "Trigger-email search hit graph.mail_search_max_pages (%d) before reaching the "
+                "%dh lookback cutoff in folder '%s' - some messages were not checked.",
+                cfg.graph.mail_search_max_pages, trigger.lookback_hours, trigger.search_folder,
+            )
+            raise EmailNotFoundError(
+                f"No email found in folder '{trigger.search_folder}' matching "
+                f"sender_filter={trigger.sender_filter!r} subject_contains={trigger.subject_contains!r} "
+                f"- but the search was truncated after {pages_seen} page(s) "
+                f"({pages_seen * cfg.graph.mail_search_page_size} messages checked) before "
+                f"reaching the {trigger.lookback_hours}h lookback cutoff. Raise "
+                "graph.mail_search_max_pages/mail_search_page_size and retry before concluding "
+                "no matching email exists."
+            )
         raise EmailNotFoundError(
             f"No email found in folder '{trigger.search_folder}' from the last "
             f"{trigger.lookback_hours}h matching sender_filter={trigger.sender_filter!r} "
@@ -121,10 +156,12 @@ def extract_attachment(message: dict, cfg: Config, dest_dir: Path) -> Path:
             f"No attachment matching pattern {pattern!r} found. Message has no attachments."
         )
 
-    resp = graph_client.graph_get(
+    all_attachments = []
+    for resp in graph_client.graph_get_pages(
         f"/users/{cfg.graph.mailbox}/messages/{message['id']}/attachments", cfg,
-    )
-    all_attachments = resp.get("value", [])
+    ):
+        all_attachments.extend(resp.get("value", []))
+
     file_attachments = [
         a for a in all_attachments if a.get("@odata.type") == "#microsoft.graph.fileAttachment"
     ]

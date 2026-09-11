@@ -68,8 +68,10 @@ email:
 
 graph:
   # Entra ID app registration (app-only / client-credentials) issued by ICT for this pipeline.
-  # Admin consent for Mail.Send + Mail.Read (Application permissions) already granted - no
-  # further consent step needed.
+  # Requires admin consent for BOTH Mail.Send and Mail.Read under Microsoft Graph ->
+  # Application permissions (not Delegated) - verify the Status column shows a green "Granted
+  # for <tenant>" against both before relying on this (it's easy for one of the two to be
+  # missed during setup and still look consented on the row that was added).
   tenant_id: "3ef9f654-aa07-41b8-88ad-a411c62bd12c"   # Directory (tenant) ID, from the app registration's Overview page
   client_id: "35aa14d5-100f-4656-a2d1-42147d9b39df"   # Application (client) ID, from the same page
   # Client secret is deliberately NOT stored here. Set GRAPH_CLIENT_SECRET in a local .env file

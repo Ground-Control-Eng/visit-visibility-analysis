@@ -196,17 +196,13 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     if not email.to:
         raise ConfigError("email.recipients.to must contain at least one recipient.")
 
-    graph_client_secret = os.environ.get("GRAPH_CLIENT_SECRET", "")
-    if not graph_client_secret:
-        raise ConfigError(
-            "GRAPH_CLIENT_SECRET environment variable is not set. Copy .env.example to .env "
-            "(in the project root) and fill in the real client secret from the Entra ID app "
-            "registration, or set GRAPH_CLIENT_SECRET as a real environment variable."
-        )
+    # GRAPH_CLIENT_SECRET is deliberately NOT required here - checked lazily by
+    # graph_client.acquire_token() the first time Graph is actually used, so an offline
+    # --dry-run-email-path run (which never touches Graph) doesn't need a .env file at all.
     graph = GraphConfig(
         tenant_id=graph_raw["tenant_id"],
         client_id=graph_raw["client_id"],
-        client_secret=graph_client_secret,
+        client_secret=os.environ.get("GRAPH_CLIENT_SECRET", ""),
         mailbox=graph_raw["mailbox"],
         request_timeout_seconds=float(graph_raw.get("request_timeout_seconds", 30)),
         max_retries=int(graph_raw.get("max_retries", 3)),
@@ -214,6 +210,16 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         mail_search_page_size=int(graph_raw.get("mail_search_page_size", 50)),
         mail_search_max_pages=int(graph_raw.get("mail_search_max_pages", 5)),
     )
+    if graph.max_retries < 0:
+        raise ConfigError("graph.max_retries must be 0 or greater.")
+    if graph.mail_search_page_size < 1:
+        raise ConfigError("graph.mail_search_page_size must be 1 or greater.")
+    if graph.mail_search_max_pages < 1:
+        raise ConfigError("graph.mail_search_max_pages must be 1 or greater.")
+    if graph.max_inline_attachment_bytes <= 0:
+        raise ConfigError("graph.max_inline_attachment_bytes must be greater than 0.")
+    if graph.request_timeout_seconds <= 0:
+        raise ConfigError("graph.request_timeout_seconds must be greater than 0.")
 
     run = RunConfig(
         output_dir=(PROJECT_ROOT / run_raw.get("output_dir", "./output")).resolve(),

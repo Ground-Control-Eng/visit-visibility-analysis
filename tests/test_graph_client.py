@@ -170,3 +170,87 @@ def test_non_retryable_4xx_fails_immediately(monkeypatch):
     with pytest.raises(graph_client.GraphApiError):
         graph_client.graph_get("/x", cfg)
     assert call_count["n"] == 1
+
+
+def test_401_triggers_one_forced_refresh_retry_even_with_max_retries_zero(monkeypatch):
+    cfg = _fake_cfg(max_retries=0)
+    force_refresh_values = []
+
+    def fake_acquire_token(cfg, force_refresh=False):
+        force_refresh_values.append(force_refresh)
+        return "tok-abc"
+
+    monkeypatch.setattr(graph_client, "acquire_token", fake_acquire_token)
+
+    responses = [
+        _FakeResponse(401, json_data={"error": {}}),
+        _FakeResponse(200, json_data={"ok": True}),
+    ]
+    call_count = {"n": 0}
+
+    def fake_request(*_args, **_kwargs):
+        resp = responses[call_count["n"]]
+        call_count["n"] += 1
+        return resp
+
+    monkeypatch.setattr(graph_client.requests, "request", fake_request)
+
+    result = graph_client.graph_get("/x", cfg)
+    assert result == {"ok": True}
+    assert call_count["n"] == 2
+    assert force_refresh_values == [False, True]
+
+
+def test_request_exception_is_retried_then_raises_graph_api_error(monkeypatch):
+    cfg = _fake_cfg(max_retries=2)
+    monkeypatch.setattr(graph_client, "acquire_token", lambda cfg, force_refresh=False: "tok-abc")
+    monkeypatch.setattr(graph_client.time, "sleep", lambda s: None)
+
+    call_count = {"n": 0}
+
+    def fake_request(*_args, **_kwargs):
+        call_count["n"] += 1
+        raise graph_client.requests.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(graph_client.requests, "request", fake_request)
+
+    with pytest.raises(graph_client.GraphApiError) as exc_info:
+        graph_client.graph_get("/x", cfg)
+
+    assert call_count["n"] == cfg.graph.max_retries + 1
+    assert exc_info.value.status_code == 0
+    assert exc_info.value.graph_code == "RequestException"
+
+
+def test_3xx_response_is_not_treated_as_success(monkeypatch):
+    cfg = _fake_cfg(max_retries=0)
+    monkeypatch.setattr(graph_client, "acquire_token", lambda cfg, force_refresh=False: "tok-abc")
+
+    def fake_request(*_args, **_kwargs):
+        return _FakeResponse(302, json_data={"error": {"code": "Redirect", "message": "moved"}})
+
+    monkeypatch.setattr(graph_client.requests, "request", fake_request)
+
+    with pytest.raises(graph_client.GraphApiError) as exc_info:
+        graph_client.graph_get("/x", cfg)
+    assert exc_info.value.status_code == 302
+
+
+def test_acquire_token_raises_graph_auth_error_when_client_secret_missing():
+    cfg = _fake_cfg()
+    cfg.graph.client_secret = ""
+
+    with pytest.raises(graph_client.GraphAuthError):
+        graph_client.acquire_token(cfg)
+
+
+def test_graph_get_pages_follows_next_link_until_exhausted(monkeypatch):
+    cfg = _fake_cfg()
+    pages = {
+        "/x": {"value": [1], "@odata.nextLink": "https://graph.microsoft.com/v1.0/next"},
+        "https://graph.microsoft.com/v1.0/next": {"value": [2]},
+    }
+    monkeypatch.setattr(graph_client, "graph_get", lambda path, cfg, params=None: pages[path])
+
+    results = list(graph_client.graph_get_pages("/x", cfg, params={"$top": 5}))
+    assert [r["value"] for r in results] == [[1], [2]]

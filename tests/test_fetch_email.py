@@ -111,7 +111,7 @@ def test_extract_attachment_matches_pattern_and_decodes_base64_content(monkeypat
             },
         ]
     }
-    monkeypatch.setattr(fetch_email.graph_client, "graph_get", lambda path, cfg: attachments_response)
+    monkeypatch.setattr(fetch_email.graph_client, "graph_get", lambda path, cfg, params=None: attachments_response)
 
     message = {"id": "msg-1", "hasAttachments": True}
     dest_path = fetch_email.extract_attachment(message, cfg, tmp_path)
@@ -127,7 +127,7 @@ def test_extract_attachment_raises_with_full_attachment_name_list_on_no_match(mo
             {"@odata.type": "#microsoft.graph.fileAttachment", "name": "unrelated.txt", "contentBytes": ""},
         ]
     }
-    monkeypatch.setattr(fetch_email.graph_client, "graph_get", lambda path, cfg: attachments_response)
+    monkeypatch.setattr(fetch_email.graph_client, "graph_get", lambda path, cfg, params=None: attachments_response)
 
     message = {"id": "msg-1", "hasAttachments": True}
     with pytest.raises(fetch_email.AttachmentNotFoundError) as exc_info:
@@ -147,3 +147,68 @@ def test_extract_attachment_skips_network_call_when_has_attachments_false(monkey
     message = {"id": "msg-1", "hasAttachments": False}
     with pytest.raises(fetch_email.AttachmentNotFoundError):
         fetch_email.extract_attachment(message, cfg, tmp_path)
+
+
+def test_extract_attachment_follows_pagination_across_multiple_pages(monkeypatch, tmp_path):
+    cfg = _fake_cfg()
+    content = b"VisitID,Status\n1,OK\n"
+    encoded = base64.b64encode(content).decode("ascii")
+    first_page_path = "/users/alex.clark@ground-control.co.uk/messages/msg-1/attachments"
+    next_link = "https://graph.microsoft.com/v1.0/users/x/messages/msg-1/attachments?%24skip=1"
+    pages = {
+        first_page_path: {
+            "value": [{"@odata.type": "#microsoft.graph.fileAttachment", "name": "unrelated.txt", "contentBytes": ""}],
+            "@odata.nextLink": next_link,
+        },
+        next_link: {
+            "value": [{
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": "production_uncompleted_visits_20260910.csv",
+                "contentBytes": encoded,
+            }],
+        },
+    }
+    monkeypatch.setattr(fetch_email.graph_client, "graph_get", lambda path, cfg, params=None: pages[path])
+
+    message = {"id": "msg-1", "hasAttachments": True}
+    dest_path = fetch_email.extract_attachment(message, cfg, tmp_path)
+
+    assert dest_path.name == "raw_attachment_production_uncompleted_visits_20260910.csv"
+    assert dest_path.read_bytes() == content
+
+
+def test_parse_graph_datetime_handles_fractional_seconds():
+    parsed = fetch_email._parse_graph_datetime("2026-09-10T10:00:00.1234567Z")
+    assert parsed == datetime(2026, 9, 10, 10, 0, 0, 123456, tzinfo=timezone.utc)
+
+
+def test_parse_graph_datetime_handles_no_fractional_seconds():
+    parsed = fetch_email._parse_graph_datetime("2026-09-10T10:00:00Z")
+    assert parsed == datetime(2026, 9, 10, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_finds_email_with_fractional_second_received_time(monkeypatch):
+    cfg = _fake_cfg()
+    now = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+    msg = _msg("with-fraction", now - timedelta(hours=1))
+    msg["receivedDateTime"] = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S") + ".1234567Z"
+    monkeypatch.setattr(fetch_email.graph_client, "graph_get", lambda path, cfg, params=None: {"value": [msg]})
+
+    result = fetch_email.find_todays_hubscape_email(cfg, now=now)
+    assert result["id"] == "with-fraction"
+
+
+def test_truncated_search_reports_distinct_error_from_genuine_no_match(monkeypatch):
+    cfg = _fake_cfg()
+    cfg.graph.mail_search_max_pages = 1
+    now = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
+    page = {
+        "value": [_msg("no-match", now - timedelta(hours=1), sender="someone-else@example.com")],
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/next-page",
+    }
+    monkeypatch.setattr(fetch_email.graph_client, "graph_get", lambda path, cfg, params=None: page)
+
+    with pytest.raises(fetch_email.EmailNotFoundError) as exc_info:
+        fetch_email.find_todays_hubscape_email(cfg, now=now)
+
+    assert "truncated" in str(exc_info.value)

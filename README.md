@@ -14,7 +14,9 @@ pip install -r requirements.txt
 sign-in is needed on the machine running this pipeline.
 
 This needs an Entra ID app registration with **Application** (not Delegated) permissions
-`Mail.Send` and `Mail.Read`, with admin consent granted by ICT. Once you have one:
+`Mail.Send` and `Mail.Read`. Verify with ICT that admin consent shows a green "Granted for
+[tenant]" against **both** permissions specifically - it's easy for one of the two to be added
+but not actually consented while still looking set up at a glance. Once you have one:
 1. Fill in `graph.tenant_id` / `graph.client_id` / `graph.mailbox` in `config.yaml` (`mailbox`
    is the address the pipeline sends from and searches in - app-only auth has no "me").
 2. Copy `.env.example` to `.env` (in the project root) and set `GRAPH_CLIENT_SECRET` to the

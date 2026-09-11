@@ -1,7 +1,7 @@
 """Orchestrates the daily visit reconciliation pipeline.
 
 Every stage is wrapped so a failure anywhere still results in a diagnostic
-failure email (or, if Outlook itself is unreachable, at least a local log entry)
+failure email (or, if Microsoft Graph itself is unreachable, at least a local log entry)
 rather than the run silently doing nothing.
 
 Usage:
@@ -59,7 +59,7 @@ def run(dry_run_email_path: Path | None = None) -> int:
         stage = "fetch_email"
         if dry_run_email_path is not None:
             attachment_path = dry_run_email_path
-            logger.info("Dry-run mode: using saved attachment at %s instead of live Outlook search.", attachment_path)
+            logger.info("Dry-run mode: using saved attachment at %s instead of live Graph search.", attachment_path)
         else:
             mail_item = fetch_email.find_todays_hubscape_email(cfg)
             stage = "extract_attachment"
@@ -141,7 +141,7 @@ def main() -> None:
         "--dry-run-email-path",
         type=Path,
         default=None,
-        help="Path to a saved Hubscape attachment; skips live Outlook search and uses this file instead.",
+        help="Path to a saved Hubscape attachment; skips live Graph search and uses this file instead.",
     )
     args = parser.parse_args()
     sys.exit(run(dry_run_email_path=args.dry_run_email_path))

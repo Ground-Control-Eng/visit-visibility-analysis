@@ -50,7 +50,6 @@ statuses:
     70: "Manually Completed"
 
 email:
-  outlook_profile: null           # null = default Outlook profile
   trigger:
     sender_filter: "ci@hubscape.co.uk"
     subject_contains: ""           # optional extra filter; blank = match on sender alone
@@ -63,18 +62,25 @@ email:
     cc: []
   send_on_success: true
   send_on_failure: true
-  # After handing a message to Outlook, how long to wait for it to actually leave the Outbox
-  # before treating the send as failed (mail.Send() alone doesn't confirm transmission - see
-  # the "Known limitation" section in README.md).
-  send_confirm_timeout_seconds: 30
-  # How many extra times to retry that wait (same queued item, never a second Send() - so no
-  # duplicate-email risk) if it's still stuck, before giving up and alerting. A transient
-  # Exchange blip can self-recover within seconds - see "Known limitation" in README.md.
-  send_confirm_retries: 2
-  # How old a leftover Outbox item matching this pipeline's subject prefix must be before it's
-  # treated as an orphan from a previous failed run and auto-deleted (kept separate from
-  # send_confirm_timeout_seconds above - see README "Known limitation" for why).
-  stale_outbox_cleanup_seconds: 3600
+  # No send-confirmation/Outbox-cleanup settings needed here - Microsoft Graph's sendMail is a
+  # single synchronous HTTPS call (202 Accepted or an error, immediately). There's no local
+  # Outbox to poll or clean up, unlike the old Outlook COM path. See graph: below.
+
+graph:
+  # Entra ID app registration (app-only / client-credentials) issued by ICT for this pipeline.
+  # Admin consent for Mail.Send + Mail.Read (Application permissions) already granted - no
+  # further consent step needed.
+  tenant_id: "3ef9f654-aa07-41b8-88ad-a411c62bd12c"   # Directory (tenant) ID, from the app registration's Overview page
+  client_id: "35aa14d5-100f-4656-a2d1-42147d9b39df"   # Application (client) ID, from the same page
+  # Client secret is deliberately NOT stored here. Set GRAPH_CLIENT_SECRET in a local .env file
+  # (copy .env.example -> .env and fill it in) or as a real environment variable. .env is
+  # gitignored - never commit the real secret.
+  mailbox: "alex.clark@ground-control.co.uk"   # mailbox to send from / search in (app-only auth has no "me")
+  request_timeout_seconds: 30
+  max_retries: 3   # extra attempts for retryable Graph errors (429/5xx), with backoff
+  max_inline_attachment_bytes: 3000000   # combined raw attachment bytes before sendMail gets unreliable inline
+  mail_search_page_size: 50
+  mail_search_max_pages: 5
 
 notifications:
   teams:

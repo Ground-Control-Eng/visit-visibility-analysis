@@ -1,150 +1,24 @@
+import base64
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import send_summary
+from src.graph_client import GraphApiError
 from src.send_summary import (
-    EMAIL_SUBJECT_PREFIX,
     _alert_via_event_log,
-    _attempt_reconnect,
-    _confirm_outbox_transmit,
-    _exchange_connection_problem,
-    _inbox_last_received,
-    _outbox_entry_ids,
-    is_stale_pipeline_outbox_item,
+    _build_attachment_payloads,
+    _prioritized_attachments,
+    _send_via_graph,
+    send_failure_email,
+    send_success_email,
 )
-
-SUBJECT = f"{EMAIL_SUBJECT_PREFIX} Summary - 2026-09-05"
-THRESHOLD = 3600
-
-
-def test_stale_pipeline_item_is_flagged():
-    now = datetime(2026, 9, 7, 12, 0, 0)
-    created_at = now - timedelta(hours=2)
-    assert is_stale_pipeline_outbox_item(SUBJECT, created_at, now, THRESHOLD) is True
-
-
-def test_fresh_pipeline_item_is_not_flagged():
-    now = datetime(2026, 9, 7, 12, 0, 0)
-    created_at = now - timedelta(seconds=5)
-    assert is_stale_pipeline_outbox_item(SUBJECT, created_at, now, THRESHOLD) is False
-
-
-def test_non_pipeline_subject_is_never_flagged_regardless_of_age():
-    now = datetime(2026, 9, 7, 12, 0, 0)
-    created_at = now - timedelta(days=30)
-    assert is_stale_pipeline_outbox_item("Some unrelated email", created_at, now, THRESHOLD) is False
-
-
-def test_boundary_at_exact_threshold():
-    now = datetime(2026, 9, 7, 12, 0, 0)
-    created_at = now - timedelta(seconds=THRESHOLD)
-    assert is_stale_pipeline_outbox_item(SUBJECT, created_at, now, THRESHOLD) is True
-
-
-def test_tz_aware_inputs_both_sides_consistent():
-    now = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
-    created_at = now - timedelta(hours=2)
-    assert is_stale_pipeline_outbox_item(SUBJECT, created_at, now, THRESHOLD) is True
-
-
-def test_naive_vs_aware_mismatch_raises_typeerror():
-    now = datetime(2026, 9, 7, 12, 0, 0)
-    created_at = datetime(2026, 9, 7, 10, 0, 0, tzinfo=timezone.utc)
-    with pytest.raises(TypeError):
-        is_stale_pipeline_outbox_item(SUBJECT, created_at, now, THRESHOLD)
-
-
-class _StubItem:
-    def __init__(self, entry_id):
-        self._entry_id = entry_id
-
-    @property
-    def EntryID(self):
-        if self._entry_id is None:
-            raise Exception("Outlook has already begun transmitting this message.")
-        return self._entry_id
-
-
-class _StubOutbox:
-    def __init__(self, items):
-        self.Items = items
-
-
-def test_outbox_entry_ids_skips_item_mid_transmission():
-    outbox = _StubOutbox([_StubItem("readable-1"), _StubItem(None), _StubItem("readable-2")])
-    assert _outbox_entry_ids(outbox) == {"readable-1", "readable-2"}
-
-
-@pytest.mark.parametrize("mode", [0, 100, 200, 300, 400])
-def test_disconnected_exchange_modes_are_flagged(mode):
-    assert _exchange_connection_problem(mode) is not None
-
-
-@pytest.mark.parametrize("mode", [500, 600, 700, 800])
-def test_connected_looking_exchange_modes_are_not_flagged(mode):
-    assert _exchange_connection_problem(mode) is None
-
-
-class _StubItems:
-    def __init__(self, items):
-        self._items = items
-
-    def Sort(self, *_args, **_kwargs):
-        pass
-
-    def GetFirst(self):
-        return self._items[0] if self._items else None
-
-
-class _StubInboxFolder:
-    def __init__(self, items):
-        self.Items = _StubItems(items)
-
-
-class _StubReceivedItem:
-    def __init__(self, received_time):
-        self.ReceivedTime = received_time
-
-
-class _StubNamespaceForInbox:
-    def __init__(self, folder=None, raise_on_get_folder=False):
-        self._folder = folder
-        self._raise = raise_on_get_folder
-
-    def GetDefaultFolder(self, _folder_id):
-        if self._raise:
-            raise Exception("Could not access Inbox")
-        return self._folder
-
-
-def test_inbox_last_received_empty_inbox_returns_none():
-    namespace = _StubNamespaceForInbox(folder=_StubInboxFolder([]))
-    assert _inbox_last_received(namespace) is None
-
-
-def test_inbox_last_received_naive_time_passed_through():
-    received = datetime(2026, 9, 9, 9, 24, 18, 182000)
-    namespace = _StubNamespaceForInbox(folder=_StubInboxFolder([_StubReceivedItem(received)]))
-    assert _inbox_last_received(namespace) == received
-
-
-def test_inbox_last_received_tz_aware_time_has_tzinfo_stripped():
-    received = datetime(2026, 9, 9, 9, 24, 18, tzinfo=timezone.utc)
-    namespace = _StubNamespaceForInbox(folder=_StubInboxFolder([_StubReceivedItem(received)]))
-    result = _inbox_last_received(namespace)
-    assert result == received.replace(tzinfo=None)
-    assert result.tzinfo is None
-
-
-def test_inbox_last_received_folder_access_failure_returns_none():
-    namespace = _StubNamespaceForInbox(raise_on_get_folder=True)
-    assert _inbox_last_received(namespace) is None
 
 
 def test_alert_via_event_log_reports_event(monkeypatch):
@@ -167,146 +41,150 @@ def test_alert_via_event_log_swallows_reporting_failure(monkeypatch):
     _alert_via_event_log("something went wrong")  # must not raise
 
 
-class _FakeClock:
-    """Lets the retry loop's timeout logic run deterministically with no real waiting."""
-
-    def __init__(self):
-        self.now = 0.0
-
-    def monotonic(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.now += seconds
+def _make_cfg(**overrides):
+    defaults = dict(
+        email=SimpleNamespace(to=["a@b.com"], cc=[]),
+        graph=SimpleNamespace(mailbox="alex.clark@ground-control.co.uk", max_inline_attachment_bytes=3_000_000),
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
 
 
-class _AttemptTrackingNamespace:
-    def __init__(self):
-        self.send_and_receive_calls = 0
+def test_prioritized_attachments_keeps_all_when_under_limit(tmp_path):
+    summary = tmp_path / "summary.csv"
+    detail = tmp_path / "detail.csv"
+    summary.write_bytes(b"a" * 100)
+    detail.write_bytes(b"b" * 100)
 
-    def SendAndReceive(self, _sync):
-        self.send_and_receive_calls += 1
-
-
-class _DynamicStubOutbox:
-    """Outbox item disappears (transmits) once send_and_receive_calls reaches leaves_on_attempt."""
-
-    def __init__(self, namespace, entry_id, leaves_on_attempt):
-        self._namespace = namespace
-        self._entry_id = entry_id
-        self._leaves_on_attempt = leaves_on_attempt
-
-    @property
-    def Items(self):
-        if self._namespace.send_and_receive_calls >= self._leaves_on_attempt:
-            return []
-        return [_StubItem(self._entry_id)]
+    result = _prioritized_attachments([summary, detail], max_bytes=1_000)
+    assert result == [summary, detail]
 
 
-def _make_cfg(timeout_seconds, retries):
-    return SimpleNamespace(
-        email=SimpleNamespace(
-            send_confirm_timeout_seconds=timeout_seconds, send_confirm_retries=retries, to=["a@b.com"],
-        )
+def test_prioritized_attachments_drops_lowest_priority_sankey_when_over_limit(tmp_path):
+    summary = tmp_path / "summary.csv"
+    sankey = tmp_path / "sankey.html"
+    summary.write_bytes(b"a" * 100)
+    sankey.write_bytes(b"b" * 5_000)
+
+    result = _prioritized_attachments([summary, sankey], max_bytes=1_000)
+    assert result == [summary]
+
+
+def test_prioritized_attachments_keeps_highest_priority_even_if_alone_it_exceeds_limit(tmp_path):
+    summary = tmp_path / "summary.csv"
+    summary.write_bytes(b"a" * 5_000)
+
+    result = _prioritized_attachments([summary], max_bytes=1_000)
+    assert result == [summary]
+
+
+def test_prioritized_attachments_skips_missing_files(tmp_path):
+    summary = tmp_path / "summary.csv"
+    summary.write_bytes(b"a" * 10)
+    missing = tmp_path / "missing.csv"
+
+    result = _prioritized_attachments([summary, missing], max_bytes=1_000)
+    assert result == [summary]
+
+
+def test_build_attachment_payloads_encodes_base64_file_attachment(tmp_path):
+    csv_path = tmp_path / "summary.csv"
+    csv_path.write_bytes(b"metric,count\nfoo,1\n")
+
+    payloads = _build_attachment_payloads([csv_path])
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert payload["@odata.type"] == "#microsoft.graph.fileAttachment"
+    assert payload["name"] == "summary.csv"
+    assert base64.b64decode(payload["contentBytes"]) == csv_path.read_bytes()
+
+
+def test_send_via_graph_builds_expected_sendmail_payload(monkeypatch, tmp_path):
+    csv_path = tmp_path / "summary.csv"
+    csv_path.write_bytes(b"metric,count\nfoo,1\n")
+    cfg = _make_cfg(email=SimpleNamespace(to=["a@b.com", "c@d.com"], cc=["e@f.com"]))
+
+    calls = []
+    monkeypatch.setattr(send_summary.graph_client, "graph_post", lambda path, cfg, json_body: calls.append((path, json_body)))
+
+    _send_via_graph("Subject line", "<html></html>", cfg, [csv_path])
+
+    assert len(calls) == 1
+    path, body = calls[0]
+    assert path == "/users/alex.clark@ground-control.co.uk/sendMail"
+    message = body["message"]
+    assert message["subject"] == "Subject line"
+    assert message["body"] == {"contentType": "HTML", "content": "<html></html>"}
+    assert message["toRecipients"] == [{"emailAddress": {"address": "a@b.com"}}, {"emailAddress": {"address": "c@d.com"}}]
+    assert message["ccRecipients"] == [{"emailAddress": {"address": "e@f.com"}}]
+    assert len(message["attachments"]) == 1
+    assert body["saveToSentItems"] is True
+
+
+def test_send_via_graph_omits_cc_key_when_no_cc_recipients(monkeypatch, tmp_path):
+    cfg = _make_cfg(email=SimpleNamespace(to=["a@b.com"], cc=[]))
+    calls = []
+    monkeypatch.setattr(send_summary.graph_client, "graph_post", lambda path, cfg, json_body: calls.append(json_body))
+
+    _send_via_graph("Subject", "<html></html>", cfg, [])
+
+    assert "ccRecipients" not in calls[0]["message"]
+
+
+def test_send_via_graph_alerts_event_log_and_raises_on_graph_api_error(monkeypatch, tmp_path):
+    cfg = _make_cfg()
+    event_log_calls = []
+    monkeypatch.setattr(send_summary, "_alert_via_event_log", lambda msg: event_log_calls.append(msg))
+
+    def _raise(*_args, **_kwargs):
+        raise GraphApiError(403, "ErrorAccessDenied", "The mailbox is not accessible.")
+
+    monkeypatch.setattr(send_summary.graph_client, "graph_post", _raise)
+
+    with pytest.raises(GraphApiError):
+        _send_via_graph("Subject", "<html></html>", cfg, [])
+
+    assert len(event_log_calls) == 1
+    assert "Subject" in event_log_calls[0]
+
+
+def test_send_success_email_test_mode_writes_local_html_without_calling_graph(monkeypatch, tmp_path):
+    cfg = SimpleNamespace(run=SimpleNamespace(test_mode=True), email=SimpleNamespace(send_on_success=True))
+    monkeypatch.setattr(
+        send_summary, "_send_via_graph",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Graph should not be called in test_mode")),
     )
 
+    summary_df = pd.DataFrame([{"metric": "TOTAL_ICE2_ROWS", "count": 0}])
+    detail_df = pd.DataFrame(columns=["issue_type", "VisitID"])
+    send_success_email(summary_df, detail_df, cfg, date(2026, 9, 5), tmp_path)
 
-def test_confirm_outbox_transmit_succeeds_without_needing_a_retry(monkeypatch):
-    clock = _FakeClock()
-    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
-    namespace = _AttemptTrackingNamespace()
-    outbox = _DynamicStubOutbox(namespace, "id-1", leaves_on_attempt=1)
-
-    assert _confirm_outbox_transmit(namespace, outbox, "subj", {"id-1"}, _make_cfg(5, 2)) is True
-    assert namespace.send_and_receive_calls == 1
+    assert (tmp_path / "would_be_email.html").exists()
 
 
-def test_confirm_outbox_transmit_succeeds_on_a_later_retry(monkeypatch):
-    clock = _FakeClock()
-    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
-    namespace = _AttemptTrackingNamespace()
-    outbox = _DynamicStubOutbox(namespace, "id-1", leaves_on_attempt=2)
+def test_send_success_email_send_on_success_false_writes_local_html_without_calling_graph(monkeypatch, tmp_path):
+    cfg = SimpleNamespace(run=SimpleNamespace(test_mode=False), email=SimpleNamespace(send_on_success=False))
+    monkeypatch.setattr(
+        send_summary, "_send_via_graph",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Graph should not be called")),
+    )
 
-    assert _confirm_outbox_transmit(namespace, outbox, "subj", {"id-1"}, _make_cfg(5, 2)) is True
-    assert namespace.send_and_receive_calls == 2
+    summary_df = pd.DataFrame([{"metric": "TOTAL_ICE2_ROWS", "count": 0}])
+    detail_df = pd.DataFrame(columns=["issue_type", "VisitID"])
+    send_success_email(summary_df, detail_df, cfg, date(2026, 9, 5), tmp_path)
 
-
-def test_confirm_outbox_transmit_gives_up_after_retries_exhausted(monkeypatch):
-    clock = _FakeClock()
-    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
-    namespace = _AttemptTrackingNamespace()
-    outbox = _DynamicStubOutbox(namespace, "id-1", leaves_on_attempt=99)
-
-    assert _confirm_outbox_transmit(namespace, outbox, "subj", {"id-1"}, _make_cfg(5, 2)) is False
-    assert namespace.send_and_receive_calls == 3  # 1 initial attempt + 2 retries
+    assert (tmp_path / "would_be_email.html").exists()
 
 
-class _StubReconnectNamespace:
-    """ExchangeConnectionMode is a function of how many SendAndReceive calls have happened so
-    far, so tests can simulate the connection clearing up right after the forced nudge."""
+def test_send_failure_email_falls_back_to_teams_when_graph_send_fails(monkeypatch, tmp_path):
+    cfg = SimpleNamespace(run=SimpleNamespace(test_mode=False), email=SimpleNamespace(send_on_failure=True))
+    monkeypatch.setattr(
+        send_summary, "_send_via_graph",
+        lambda *a, **k: (_ for _ in ()).throw(GraphApiError(500, "InternalServerError", "boom")),
+    )
+    teams_calls = []
+    monkeypatch.setattr(send_summary.notify_teams, "send_teams_alert", lambda *a, **k: teams_calls.append(a))
 
-    def __init__(self, mode_by_send_and_receive_calls):
-        self.logon_calls = 0
-        self.send_and_receive_calls = 0
-        self._mode_by_calls = mode_by_send_and_receive_calls
+    send_failure_email("query_ice2", RuntimeError("db unreachable"), cfg, date(2026, 9, 5), tmp_path)
 
-    def Logon(self, *_args):
-        self.logon_calls += 1
-
-    def SendAndReceive(self, _sync):
-        self.send_and_receive_calls += 1
-
-    @property
-    def ExchangeConnectionMode(self):
-        return self._mode_by_calls(self.send_and_receive_calls)
-
-
-def test_attempt_reconnect_recovers_after_the_nudge(monkeypatch):
-    clock = _FakeClock()
-    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
-    namespace = _StubReconnectNamespace(lambda calls: 500 if calls >= 1 else 400)
-
-    assert _attempt_reconnect(namespace, wait_seconds=10) == 500
-    assert namespace.logon_calls == 1
-    assert namespace.send_and_receive_calls == 1
-
-
-def test_attempt_reconnect_gives_up_after_wait_seconds_if_still_bad(monkeypatch):
-    clock = _FakeClock()
-    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
-    namespace = _StubReconnectNamespace(lambda _calls: 400)
-
-    assert _attempt_reconnect(namespace, wait_seconds=5) == 400
-
-
-def test_attempt_reconnect_swallows_logon_failure(monkeypatch):
-    clock = _FakeClock()
-    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
-
-    class _RaisingLogonNamespace(_StubReconnectNamespace):
-        def Logon(self, *_args):
-            raise Exception("You are already logged on.")
-
-    namespace = _RaisingLogonNamespace(lambda calls: 500 if calls >= 1 else 400)
-
-    assert _attempt_reconnect(namespace, wait_seconds=10) == 500
-
-
-def test_attempt_reconnect_swallows_send_and_receive_failure(monkeypatch):
-    clock = _FakeClock()
-    monkeypatch.setattr(send_summary.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(send_summary.time, "sleep", clock.sleep)
-
-    class _RaisingSendReceiveNamespace(_StubReconnectNamespace):
-        def SendAndReceive(self, _sync):
-            raise Exception("boom")
-
-    namespace = _RaisingSendReceiveNamespace(lambda _calls: 400)
-
-    assert _attempt_reconnect(namespace, wait_seconds=5) == 400
+    assert len(teams_calls) == 1

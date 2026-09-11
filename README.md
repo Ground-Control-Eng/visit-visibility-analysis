@@ -9,15 +9,22 @@ mapped copy), and Hubscape (what delivery teams see, active visits only).
 pip install -r requirements.txt
 ```
 
-This pipeline requires **Classic Outlook**, not New Outlook, on the machine running it.
-`src/send_summary.py` and `src/fetch_email.py` both automate Outlook via COM (the classic
-Outlook Object Model - `win32com.client.Dispatch("Outlook.Application")`). New Outlook doesn't
-support this: Microsoft has confirmed New Outlook has no COM/Object-Model automation and no
-VBA/VSTO/COM add-in support, so there's no `Outlook.Application` COM server for it to `Dispatch()`
-against. The only supported programmatic path for a New-Outlook-era mailbox is Microsoft Graph
-API, which would be a genuine replatform, not a config change - out of scope unless a future
-change decides to take that on. Until then, keep Classic Outlook installed and set as the
-default mail handler for the account the Scheduled Task runs as.
+`src/send_summary.py` and `src/fetch_email.py` send/fetch email via **Microsoft Graph API**
+(app-only / client-credentials auth), not Outlook - no Outlook installation or interactive
+sign-in is needed on the machine running this pipeline.
+
+This needs an Entra ID app registration with **Application** (not Delegated) permissions
+`Mail.Send` and `Mail.Read`. Verify with ICT that admin consent shows a green "Granted for
+[tenant]" against **both** permissions specifically - it's easy for one of the two to be added
+but not actually consented while still looking set up at a glance. Once you have one:
+1. Fill in `graph.tenant_id` / `graph.client_id` / `graph.mailbox` in `config.yaml` (`mailbox`
+   is the address the pipeline sends from and searches in - app-only auth has no "me").
+2. Copy `.env.example` to `.env` (in the project root) and set `GRAPH_CLIENT_SECRET` to the
+   app registration's client secret. `.env` is gitignored - never commit the real secret.
+
+`pywin32` is still a dependency, but no longer for Outlook - it's kept for the Windows Event
+Log alert (`src/send_summary.py`, `_alert_via_event_log`) and for the Excel-COM workaround
+described below (`src/query_databases.py`), both unchanged by this.
 
 The ICe2 connection (`GCV-PROD-SQL01`) uses Windows-integrated auth and needs no setup.
 
@@ -39,7 +46,7 @@ This means:
 - If the refresh doesn't complete within `sql.visits_api_excel.refresh_timeout_seconds` (default
   180s), the run fails with a diagnostic error instead of hanging indefinitely.
 
-Optional: a Microsoft Teams fallback alert (see "Known limitation" below) for when Outlook can't
+Optional: a Microsoft Teams fallback alert (see "Known limitation" below) for when Graph can't
 send the failure-alert email either. To set it up, in the target Teams channel: "..." > Workflows
 > "Post to a channel when a webhook request is received" > complete the wizard > paste the URL it
 gives you into `notifications.teams.webhook_url` in `config.yaml`. Leave it `null` to skip this -
@@ -50,9 +57,9 @@ it's optional and the run won't fail because it's unset.
 All settings live in `config.yaml` - no code changes needed to retune:
 - SQL server/database names and auth mode
 - Which `VisitStatusID`s are legitimately excluded from Hubscape's active-only export
-- The Outlook search filter for the daily trigger email (sender, subject, folder, lookback)
+- The Graph search filter for the daily trigger email (sender, subject, folder, lookback)
 - Recipients for the summary email
-- `run.test_mode`: when `true`, the pipeline runs for real (real SQL, real Outlook search)
+- `run.test_mode`: when `true`, the pipeline runs for real (real SQL, real Graph search)
   but writes the would-be email to `output/YYYY-MM-DD/` instead of sending it, and also
   saves the raw ICe2/Visits API extracts there for debugging. Set to `false` once you're
   confident in the output, before relying on the live scheduled run.
@@ -85,7 +92,7 @@ without a code change.
 python -m src.main
 ```
 
-To test against a saved sample attachment instead of searching Outlook live:
+To test against a saved sample attachment instead of searching live via Graph:
 
 ```powershell
 python -m src.main --dry-run-email-path samples\some_saved_attachment.csv
@@ -98,7 +105,7 @@ python -m pytest tests\
 ```
 
 `tests/test_reconcile.py` covers every reconciliation issue type against synthetic data -
-no database or Outlook connection required.
+no database or Graph connection required.
 
 ## Output
 
@@ -142,100 +149,49 @@ Once you've manually reviewed a few days of `test_mode: true` output and are hap
    scheduled_task\register_task.ps1
    ```
    This registers a daily 21:15 task (the Hubscape email typically arrives ~20:30) running
-   as your Windows user, with "run only when logged on" - required because the pipeline
-   drives Outlook via COM, which needs an interactive desktop session. A locked (but
-   logged-in) session should be fine; a fully logged-off session will not run the task.
+   as your Windows user, with "run only when logged on". This was originally required because
+   the pipeline drove Outlook via COM, which needed an interactive desktop session - that's now
+   gone (migrated to Microsoft Graph, see Setup above, which needs no interactive session at
+   all). `src/query_databases.py` still drives Excel via COM for the Visits API workaround
+   (unchanged, out of scope for the Graph migration) and **may** have the same interactive-
+   session requirement - this hasn't been verified empirically, so don't change `-LogonType`
+   away from `Interactive` until that's confirmed safe. A locked (but logged-in) session should
+   be fine either way; a fully logged-off session will not run the task.
 
 To change the run time: `scheduled_task\register_task.ps1 -RunTime "22:00"`.
 
 ## Known limitation
 
-If Outlook itself is unreachable when a run fails (not signed in, or closed), the script
-can't send its own failure-alert email through Outlook. In that case the failure is still
-recorded in `output/YYYY-MM-DD/run_log.txt` - check there if a day's summary email doesn't
-arrive at all.
+Microsoft Graph's app-only (client-credentials) auth has no interactive user or session at
+all - there's no desktop Outlook connection to go stale, so the entire class of "stuck in the
+Outbox with a silently expired Exchange session" failures this section used to document
+(reconnect nudges, `ExchangeConnectionMode` checks, Outbox-transmit polling) cannot occur here
+and no longer exists in the code.
 
-A second, easier-to-miss failure mode: `mail.Send()` only queues a message into Outlook's
-local Outbox - it does **not** confirm the message was actually transmitted, and it doesn't
-raise an exception even if Outlook's connection to Exchange has silently gone stale (e.g. a
-Modern Auth/MFA session that expired with no one present to re-authenticate it). Outlook can
-sit in this state indefinitely without reporting itself as "offline" - the only visible sign
-is that no new mail arrives in the Inbox either. Before this fix, that meant the log would
-say `Sent email '...'` while the message sat unsent in the Outbox forever.
+`_send_via_graph()` (`src/send_summary.py`) sends via a single synchronous `POST
+/users/{mailbox}/sendMail` call - a 202 response means Graph has accepted the message for
+delivery immediately, no local queue to get stuck in. Transient errors (HTTP 429, honoring
+`Retry-After`, or 5xx) are retried automatically with backoff, up to `graph.max_retries`
+(default 3) extra attempts (`src/graph_client.py`). A persistent failure raises, is logged to
+`run_log.txt`, and a diagnostic entry is written to the Windows Application Event Log (source
+"Visit Reconciliation") - a channel independent of Graph/email entirely, so the alert still
+lands even if the failure-notification email itself can't send. This requires the event source
+to have been registered once via an elevated `scheduled_task\register_task.ps1` run; if that
+hasn't been done, the write is skipped harmlessly (logged locally) rather than masking the
+original error.
 
-`_send_via_outlook()` (`src/send_summary.py`) now guards against this on two levels:
+If a run still can't get a failure email out at all (e.g. the app registration's credentials
+are wrong or revoked), `send_failure_email()` additionally posts to a Teams channel webhook
+(`notifications.teams.webhook_url` in `config.yaml` - see Setup above) via a plain HTTPS
+request (`src/notify_teams.py`) with no Graph/Outlook involved at all - so there's still a
+notification path when Graph itself is what's broken. This is a fallback only: it doesn't fire
+on a normal successful run, and if the webhook isn't configured yet, it just logs a warning
+rather than blocking anything. `main.py` also always returns a non-zero exit code on failure -
+check the Scheduled Task's "Last Run Result" in Task Scheduler as a backstop, alongside
+`run_log.txt` and the Event Log, if no email arrives and you're not sure why.
 
-- Before attempting a send, it checks `Namespace.ExchangeConnectionMode` (not just
-  `Namespace.Offline`, which only ever catches a manual "Work Offline" toggle and stays
-  `False` for a stale/disconnected session). If the mode is unambiguously bad
-  (`olNoExchange`/`olOffline`/`olCachedOffline`/`olDisconnected`/`olCachedDisconnected`), it
-  first tries a best-effort reconnect nudge (`_attempt_reconnect()`: re-issues
-  `Namespace.Logon` and forces a `Namespace.SendAndReceive`, then re-checks the connection mode
-  for up to `email.send_confirm_timeout_seconds`) before giving up. This is what actually
-  prompts Outlook's own identity module to either silently refresh an expiring token (a
-  transient blip that self-recovers) or surface its own sign-in prompt for whoever's at the
-  machine to complete - it does **not** and cannot complete an MFA challenge itself, so a truly
-  expired session still requires a person at the keyboard. Only if the mode is still bad after
-  the nudge does it fail with that diagnosis instead of waiting out the full Outbox-poll timeout.
-- Otherwise, it snapshots the Outbox before/after `Send()` to identify the freshly-queued
-  item, forces an immediate Send/Receive, and polls for up to
-  `email.send_confirm_timeout_seconds` (default 30s, `config.yaml`) for that item to actually
-  leave the Outbox. A stuck-but-"connected"-looking session can be a transient blip that
-  self-recovers within seconds (observed in practice: a failure-alert for this exact timeout
-  transmitted instantly moments later), so this wait is retried up to
-  `email.send_confirm_retries` extra times (default 2, i.e. 3 attempts total) before giving
-  up - always re-polling the *same* queued item, never calling `Send()` again, so there's no
-  risk of a duplicate email going out. Only once every attempt has timed out does the
-  resulting error report `ExchangeConnectionMode` at that point and the Inbox's most-recent
-  `ReceivedTime` before vs. after the send attempt - operationalizing "no new mail arriving is
-  a red flag" into the error text itself, since a stalled cached-mode session can still report
-  a connected-looking mode.
-
-Either way the run now fails loudly (non-zero exit, logged error, a failure-email attempt)
-instead of falsely logging success, and a diagnostic entry is written to the Windows
-Application Event Log (source "Visit Reconciliation") - a channel independent of Outlook, so
-the alert still lands even if the failure-notification email itself can't send either. This
-requires the event source to have been registered once via an elevated
-`scheduled_task\register_task.ps1` run; if that hasn't been done, the write is skipped
-harmlessly (logged locally) rather than masking the original error.
-
-If Outlook's connection has gone stale like this, it typically needs an interactive
-re-sign-in (closing and reopening Outlook, or completing an MFA prompt) - something only a
-person at the keyboard can do; there's no way around this in this scenario, so if the
-pipeline keeps failing this way, check Event Viewer (Windows Logs > Application, source
-"Visit Reconciliation") or `run_log.txt` for the diagnosis, and reconnect Outlook.
-
-If a run *still* can't get a failure email out at all (Outlook fully unreachable), `main.py`
-still returns a non-zero exit code - check the Scheduled Task's "Last Run Result" in Task
-Scheduler as a backstop, alongside `run_log.txt` and the Event Log, if no email arrives and
-you're not sure why.
-
-A `700` (`olCachedConnectedDrizzle`) or other value outside the unambiguously-bad set above
-means Outlook *reports* itself connected, but this doesn't guarantee it's actually syncing -
-observed in practice: a session sat at `700` for several hours across multiple runs, with the
-Inbox never advancing either, and no Outbox send ever transmitting. Nothing server-side can
-distinguish this from a healthy-but-quiet mailbox in advance, so it's only caught by the
-Outbox-poll timeout above, same as any other stuck send - it just won't show up as an
-unambiguous `ExchangeConnectionMode` before the send is attempted.
-
-Because a failure like that also blocks the failure-alert email itself, `send_failure_email()`
-additionally posts to a Teams channel webhook (`notifications.teams.webhook_url` in
-`config.yaml` - see Setup above) whenever the Outlook send fails, via a plain HTTPS request
-(`src/notify_teams.py`) with no Outlook/COM involved - so there's still a notification path when
-Outlook is the thing that's broken. This is a fallback only: it doesn't fire on a normal
-successful run, and if the webhook itself isn't configured yet, it just logs a warning rather
-than blocking anything.
-
-On top of detecting a stuck send, every send attempt now also auto-deletes any leftover
-Outbox item matching this pipeline's subject prefix ("Visit Reconciliation...") that's older
-than `email.stale_outbox_cleanup_seconds` (default 1 hour, `config.yaml`), logging a warning
-with its subject and age. This means a prior run's stuck item no longer has to be deleted by
-hand before the next run can get its own email out - previously, if the connection recovered
-on its own, the next scheduled run would still find the same stuck item sitting in the Outbox
-and someone had to clear it manually before a retry could succeed. This only clears the
-symptom (a blocked Outbox); if the underlying stale Exchange session keeps recurring, it
-still typically needs the interactive re-sign-in described above.
-
-Briefly being unable to read an Outbox item's properties (Outlook raises "already begun
-transmitting this message") is expected right as a message starts sending, and is handled
-gracefully - it's not itself a sign of a problem, just that the item is actively going out.
+One real attachment-size caveat: `sendMail`'s inline (base64) attachments become unreliable
+above a few MB combined. If the run's attachments (`summary.csv`, `detail.csv`, `sankey.html`,
+etc.) together exceed `graph.max_inline_attachment_bytes` (default ~3MB), the lowest-priority
+ones are dropped (logged as a warning in `run_log.txt`) rather than failing the whole send -
+`sankey.html` is the most likely one to grow large enough to matter.

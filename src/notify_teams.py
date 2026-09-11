@@ -1,7 +1,7 @@
-"""Last-resort fallback alert via a Microsoft Teams channel webhook - used only when Outlook
-can't send the failure-alert email either (see send_summary.send_failure_email). Deliberately
-independent of Outlook/Exchange: a plain HTTPS POST via the stdlib, no COM involved, so it still
-works when the whole reason we're here is that Outlook's Exchange connection is unhealthy.
+"""Last-resort fallback alert via a Microsoft Teams channel webhook - used only when Microsoft
+Graph can't send the failure-alert email either (see send_summary.send_failure_email).
+Deliberately independent of Graph/Outlook: a plain HTTPS POST via the stdlib, so it still works
+when the whole reason we're here is that Graph itself is unreachable or misconfigured.
 """
 from __future__ import annotations
 

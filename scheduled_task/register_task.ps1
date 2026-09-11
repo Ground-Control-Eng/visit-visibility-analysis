@@ -3,15 +3,20 @@
     Registers (or re-registers) the daily "Visit Reconciliation" Windows Scheduled Task.
 
 .NOTES
-    Run "only when user is logged on" is required because the script drives Outlook via COM,
-    which needs an interactive desktop session. This means the task will not run if the
-    machine is fully logged off (a locked session should still be fine, but test this on
-    this specific machine before relying on it unattended).
+    Run "only when user is logged on" was originally required because the script drove Outlook
+    via COM, which needed an interactive desktop session. That's now gone - email send/fetch
+    was migrated to Microsoft Graph (app-only auth, no interactive session needed at all).
+    src/query_databases.py still drives Excel via COM for the Visits API workaround (unchanged,
+    out of scope for the Graph migration) and MAY have the same interactive-session requirement
+    - this hasn't been verified empirically, so -LogonType is left as Interactive until that's
+    confirmed safe. This means the task will not run if the machine is fully logged off (a
+    locked session should still be fine, but test this on this specific machine before relying
+    on it unattended).
 
     Also registers the "Visit Reconciliation" Windows Event Log source used to alert on a
-    stuck/disconnected Outlook send (src/send_summary.py, _alert_via_event_log) - this needs
-    an elevated (admin) PowerShell session, since the scheduled task itself runs as a
-    non-elevated interactive user and typically can't register a new event source at runtime.
+    failed Graph send (src/send_summary.py, _alert_via_event_log) - this needs an elevated
+    (admin) PowerShell session, since the scheduled task itself runs as a non-elevated
+    interactive user and typically can't register a new event source at runtime.
 #>
 
 param(

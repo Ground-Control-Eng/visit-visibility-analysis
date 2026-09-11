@@ -16,7 +16,7 @@ def find_previous_detail_csv(output_dir: Path, run_date: date, max_days_back: in
     """Most recent run_date-N folder (N=1..max_days_back) containing a detail.csv, or None.
 
     Searches backward day by day rather than requiring exactly run_date - 1, so a day the
-    pipeline didn't run at all (failure, Outlook unreachable) doesn't lose track of an ID that's
+    pipeline didn't run at all (failure, Graph unreachable) doesn't lose track of an ID that's
     genuinely still stuck - the Visits API's own nightly retry runs regardless of whether this
     reconciliation script ran that day.
     """

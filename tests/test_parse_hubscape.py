@@ -26,13 +26,11 @@ def make_cfg() -> Config:
         legitimately_excluded_from_hubscape={50, 60, 70},
         status_legend={},
         email=EmailConfig(
-            outlook_profile=None,
             trigger=EmailTriggerConfig(
                 sender_filter="ci@hubscape.co.uk", subject_contains="", search_folder="Inbox",
                 lookback_hours=30, attachment_name_pattern="production_uncompleted_visits_*.csv",
             ),
             to=["alex.clark@ground-control.co.uk"], cc=[], send_on_success=True, send_on_failure=True,
-            send_confirm_timeout_seconds=30, send_confirm_retries=2, stale_outbox_cleanup_seconds=3600,
         ),
         hubscape_api_id_column="External Visit API Id",
         run=RunConfig(output_dir=Path("./output"), keep_days=90, test_mode=True),

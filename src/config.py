@@ -1,6 +1,7 @@
 """Loads and validates config.yaml so no code changes are needed to retune the pipeline."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 
 _PLACEHOLDER_MARKERS = ("PLACEHOLDER", "CONFIRM")
 
@@ -44,15 +46,24 @@ class EmailTriggerConfig:
 
 @dataclass
 class EmailConfig:
-    outlook_profile: str | None
     trigger: EmailTriggerConfig
     to: list
     cc: list
     send_on_success: bool
     send_on_failure: bool
-    send_confirm_timeout_seconds: float
-    send_confirm_retries: int
-    stale_outbox_cleanup_seconds: float
+
+
+@dataclass
+class GraphConfig:
+    tenant_id: str
+    client_id: str
+    client_secret: str
+    mailbox: str
+    request_timeout_seconds: float = 30.0
+    max_retries: int = 3
+    max_inline_attachment_bytes: int = 3_000_000
+    mail_search_page_size: int = 50
+    mail_search_max_pages: int = 5
 
 
 @dataclass
@@ -84,6 +95,9 @@ class Config:
     # Trailing + defaulted so existing call sites (tests building a Config by hand) don't need
     # to know about it - real runs get the loaded value from load_config() below regardless.
     teams: TeamsConfig = field(default_factory=lambda: TeamsConfig(webhook_url=None))
+    graph: GraphConfig = field(
+        default_factory=lambda: GraphConfig(tenant_id="", client_id="", client_secret="", mailbox="")
+    )
 
 
 def _check_placeholder(value, path: str) -> None:
@@ -94,10 +108,28 @@ def _check_placeholder(value, path: str) -> None:
         )
 
 
+def _load_dotenv(path: Path) -> None:
+    """Minimal KEY=VALUE .env loader - sets os.environ for keys not already set (never
+    overrides a real environment variable). A dependency like python-dotenv is disproportionate
+    for the single secret (GRAPH_CLIENT_SECRET) this project needs."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     path = Path(path)
     if not path.exists():
         raise ConfigError(f"Config file not found: {path}")
+
+    _load_dotenv(DEFAULT_ENV_PATH)
 
     with path.open("r", encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
@@ -113,6 +145,7 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         recipients_raw = email_raw["recipients"]
         hub_cols_raw = raw["hubscape_columns"]
         run_raw = raw["run"]
+        graph_raw = raw["graph"]
     except KeyError as exc:
         raise ConfigError(f"config.yaml is missing required section: {exc}") from exc
 
@@ -121,6 +154,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     _check_placeholder(api_raw.get("path"), "sql.visits_api_excel.path")
     _check_placeholder(trigger_raw.get("sender_filter"), "email.trigger.sender_filter")
     _check_placeholder(hub_cols_raw.get("api_id_column"), "hubscape_columns.api_id_column")
+    for key in ("tenant_id", "client_id", "mailbox"):
+        _check_placeholder(graph_raw.get(key), f"graph.{key}")
 
     if not trigger_raw.get("sender_filter") and not trigger_raw.get("subject_contains"):
         raise ConfigError(
@@ -145,7 +180,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     )
 
     email = EmailConfig(
-        outlook_profile=email_raw.get("outlook_profile"),
         trigger=EmailTriggerConfig(
             sender_filter=trigger_raw.get("sender_filter", ""),
             subject_contains=trigger_raw.get("subject_contains", ""),
@@ -157,28 +191,35 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         cc=recipients_raw.get("cc", []),
         send_on_success=bool(email_raw.get("send_on_success", True)),
         send_on_failure=bool(email_raw.get("send_on_failure", True)),
-        send_confirm_timeout_seconds=float(email_raw.get("send_confirm_timeout_seconds", 30)),
-        send_confirm_retries=int(email_raw.get("send_confirm_retries", 2)),
-        stale_outbox_cleanup_seconds=float(email_raw.get("stale_outbox_cleanup_seconds", 3600)),
     )
 
     if not email.to:
         raise ConfigError("email.recipients.to must contain at least one recipient.")
 
-    if email.send_confirm_timeout_seconds <= 0:
-        raise ConfigError("email.send_confirm_timeout_seconds must be greater than 0.")
-
-    if email.send_confirm_retries < 0:
-        raise ConfigError("email.send_confirm_retries must be 0 or greater.")
-
-    max_confirm_wait_seconds = email.send_confirm_timeout_seconds * (email.send_confirm_retries + 1)
-    if email.stale_outbox_cleanup_seconds <= max_confirm_wait_seconds:
-        raise ConfigError(
-            "email.stale_outbox_cleanup_seconds must be greater than send_confirm_timeout_seconds * "
-            "(send_confirm_retries + 1) - otherwise a message that just timed out in this run "
-            "(across all its confirm retries) could be deleted as 'stale' before it's had a real "
-            "chance to be judged abandoned."
-        )
+    # GRAPH_CLIENT_SECRET is deliberately NOT required here - checked lazily by
+    # graph_client.acquire_token() the first time Graph is actually used, so an offline
+    # --dry-run-email-path run (which never touches Graph) doesn't need a .env file at all.
+    graph = GraphConfig(
+        tenant_id=graph_raw["tenant_id"],
+        client_id=graph_raw["client_id"],
+        client_secret=os.environ.get("GRAPH_CLIENT_SECRET", ""),
+        mailbox=graph_raw["mailbox"],
+        request_timeout_seconds=float(graph_raw.get("request_timeout_seconds", 30)),
+        max_retries=int(graph_raw.get("max_retries", 3)),
+        max_inline_attachment_bytes=int(graph_raw.get("max_inline_attachment_bytes", 3_000_000)),
+        mail_search_page_size=int(graph_raw.get("mail_search_page_size", 50)),
+        mail_search_max_pages=int(graph_raw.get("mail_search_max_pages", 5)),
+    )
+    if graph.max_retries < 0:
+        raise ConfigError("graph.max_retries must be 0 or greater.")
+    if graph.mail_search_page_size < 1:
+        raise ConfigError("graph.mail_search_page_size must be 1 or greater.")
+    if graph.mail_search_max_pages < 1:
+        raise ConfigError("graph.mail_search_max_pages must be 1 or greater.")
+    if graph.max_inline_attachment_bytes <= 0:
+        raise ConfigError("graph.max_inline_attachment_bytes must be greater than 0.")
+    if graph.request_timeout_seconds <= 0:
+        raise ConfigError("graph.request_timeout_seconds must be greater than 0.")
 
     run = RunConfig(
         output_dir=(PROJECT_ROOT / run_raw.get("output_dir", "./output")).resolve(),
@@ -204,5 +245,6 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
         email=email,
         hubscape_api_id_column=hub_cols_raw.get("api_id_column", "External Visit API Id"),
         teams=teams,
+        graph=graph,
         run=run,
     )

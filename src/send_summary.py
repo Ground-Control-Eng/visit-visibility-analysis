@@ -1,39 +1,35 @@
-"""Builds and sends the daily summary/failure email via Outlook COM."""
+"""Builds and sends the daily summary/failure email via Microsoft Graph."""
 from __future__ import annotations
 
+import base64
 import logging
-import time
-from datetime import date, datetime
+import mimetypes
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
-from . import notify_teams
+from . import graph_client, notify_teams
 from .config import Config
 from .reconcile import ALERT_ISSUE_TYPES, INFORMATIONAL_ISSUE_TYPES, RECONCILIATION_ACCOUNTING_TYPES
 
 logger = logging.getLogger("visit_reconciliation")
-
-_OUTLOOK_FOLDER_OUTBOX = 4  # olFolderOutbox
-_OUTLOOK_FOLDER_INBOX = 6  # olFolderInbox
-
-# OlExchangeConnectionMode values that unambiguously mean "not actually connected to Exchange"
-# (per Microsoft's OlExchangeConnectionMode enum). namespace.Offline only ever catches the two
-# "Offline" rows below - it stays False for a stale/disconnected Modern Auth session, which is
-# exactly the recurring failure mode this guards against (see README "Known limitation").
-_EXCHANGE_DISCONNECTED_MODES = {
-    0: "olNoExchange - this profile isn't on an Exchange account",
-    100: "olOffline - classic offline mode",
-    200: "olCachedOffline - Work Offline is selected",
-    300: "olDisconnected - disconnected from the Exchange server",
-    400: "olCachedDisconnected - cached mode, disconnected from the Exchange server",
-}
 
 EMAIL_SUBJECT_PREFIX = "Visit Reconciliation"
 
 # Matches COLOR_CRITICAL in visualize.py - kept as a local literal rather than an import so the
 # two modules stay decoupled.
 REPEAT_FAILURE_ROW_STYLE = "background-color:#fbe1e1;font-weight:bold"
+
+# Priority order for dropping attachments if their combined size would exceed
+# graph.max_inline_attachment_bytes (sankey.html, likely the largest, is dropped first).
+_ATTACHMENT_PRIORITY = (
+    "summary.csv",
+    "detail.csv",
+    "missing_from_hubscape_by_year_and_team.csv",
+    "run_log.txt",
+    "sankey.html",
+)
 
 
 def _df_to_html_table(df: pd.DataFrame, max_rows: int | None = None) -> str:
@@ -156,78 +152,12 @@ def _build_failure_html(stage: str, exception: Exception, run_date: date, log_pa
     """
 
 
-def is_stale_pipeline_outbox_item(
-    subject: str, created_at: datetime, now: datetime, threshold_seconds: float,
-) -> bool:
-    """Whether an Outbox item is this pipeline's and old enough to be an orphan from a
-    previous run's stuck send, rather than a normal in-flight one.
-
-    created_at and now must both be naive or both tz-aware (mismatched inputs raise
-    TypeError on subtraction) - callers passing Outlook COM's tz-aware CreationTime should
-    strip its tzinfo first, as src/fetch_email.py already does for ReceivedTime.
-    """
-    if not subject.startswith(EMAIL_SUBJECT_PREFIX):
-        return False
-    return (now - created_at).total_seconds() >= threshold_seconds
-
-
-def _outbox_entry_ids(outbox) -> set[str]:
-    """EntryIDs of all readable Outbox items - skips any item mid-transmission (touching one
-    raises 'Outlook has already begun transmitting this message', which isn't an actual error,
-    just a sign the item is actively going out)."""
-    ids = set()
-    for item in outbox.Items:
-        try:
-            ids.add(item.EntryID)
-        except Exception:  # noqa: BLE001
-            continue
-    return ids
-
-
-def _exchange_connection_problem(connection_mode: int) -> str | None:
-    """None if connection_mode looks healthy; otherwise a human-readable diagnosis. Note: a
-    value not in _EXCHANGE_DISCONNECTED_MODES ("looks connected") does NOT guarantee Outlook is
-    actually syncing - a stalled cached-mode session can still report e.g.
-    olCachedConnectedFull - see _send_via_outlook's Outbox-poll fallback for that case."""
-    return _EXCHANGE_DISCONNECTED_MODES.get(connection_mode)
-
-
-def _read_exchange_connection_mode(namespace) -> int | None:
-    """Best-effort read of namespace.ExchangeConnectionMode - None if the COM property access
-    itself fails (e.g. a transient COM error), so a read failure degrades to 'inconclusive'
-    rather than raising a secondary exception that would mask the real diagnosis and skip the
-    Event Log alert."""
-    try:
-        return namespace.ExchangeConnectionMode
-    except Exception:  # noqa: BLE001
-        logger.warning("Could not read namespace.ExchangeConnectionMode.", exc_info=True)
-        return None
-
-
-def _inbox_last_received(namespace) -> datetime | None:
-    """Best-effort read of the most recent Inbox ReceivedTime, or None on any failure (e.g. an
-    empty folder). An independent corroborating signal: a stale Exchange session can still
-    report a 'connected'-looking ExchangeConnectionMode while no new mail is actually
-    arriving."""
-    try:
-        inbox = namespace.GetDefaultFolder(_OUTLOOK_FOLDER_INBOX)
-        items = inbox.Items
-        items.Sort("[ReceivedTime]", True)
-        latest = items.GetFirst()
-        if latest is None:
-            return None
-        received_at = latest.ReceivedTime
-        return received_at.replace(tzinfo=None) if received_at.tzinfo else received_at
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _alert_via_event_log(message: str) -> None:
     """Best-effort write to the Windows Application Event Log - a channel independent of
-    Outlook, so it still fires when Outlook itself is what's broken (see README "Known
-    limitation"). Requires the "Visit Reconciliation" event source to have been registered once
-    (scheduled_task/register_task.ps1, elevated) - if that hasn't been done, or the write fails
-    for any other reason, this just logs locally rather than masking the original error."""
+    Microsoft Graph, so it still fires when Graph itself is what's broken. Requires the "Visit
+    Reconciliation" event source to have been registered once (scheduled_task/register_task.ps1,
+    elevated) - if that hasn't been done, or the write fails for any other reason, this just
+    logs locally rather than masking the original error."""
     try:
         import win32evtlog  # noqa: PLC0415
         import win32evtlogutil  # noqa: PLC0415
@@ -239,170 +169,73 @@ def _alert_via_event_log(message: str) -> None:
         logger.exception("Could not write alert to the Windows Event Log either.")
 
 
-def _cleanup_stale_outbox_items(outbox, threshold_seconds: float) -> None:
-    """Deletes leftover Outbox items from a previous failed run so they don't sit there
-    indefinitely requiring manual cleanup before the next send can get through."""
-    # Snapshot into a plain list first - deleting while iterating Outlook's live COM
-    # collection re-indexes it mid-loop and silently skips entries.
-    for item in list(outbox.Items):
+def _prioritized_attachments(attachments: list[Path], max_bytes: int) -> list[Path]:
+    """Drops lowest-priority attachments (per _ATTACHMENT_PRIORITY) if the combined raw size of
+    the existing attachment files would exceed max_bytes - Graph's sendMail is unreliable with
+    very large inline (base64) attachments. Never drops the single highest-priority attachment
+    even if it alone exceeds the limit."""
+    existing = [p for p in attachments if p.exists()]
+
+    def priority(p: Path) -> int:
         try:
-            subject = item.Subject
-            created_at = item.CreationTime
-        except Exception:  # noqa: BLE001
-            continue
-        created_at = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
-        now = datetime.now()
-        if not is_stale_pipeline_outbox_item(subject, created_at, now, threshold_seconds):
-            continue
+            return _ATTACHMENT_PRIORITY.index(p.name)
+        except ValueError:
+            return len(_ATTACHMENT_PRIORITY)
 
-        age_seconds = (now - created_at).total_seconds()
-        logger.warning(
-            "Deleting stale Outbox item left over from a previous run: subject=%r, age=%.0fs "
-            "(threshold=%.0fs). It will not be sent - see that day's output folder for the "
-            "original report content if it's still needed.",
-            subject, age_seconds, threshold_seconds,
-        )
-        try:
-            item.Delete()
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to delete stale Outbox item with subject=%r.", subject)
-
-
-def _attempt_reconnect(namespace, wait_seconds: float) -> int | None:
-    """Best-effort nudge to clear a stale Exchange connection before giving up: re-issues
-    Namespace.Logon (a no-op if a MAPI session is already active - harmless either way) and
-    forces a Send/Receive, which is what actually prompts Outlook's own identity module to
-    either silently refresh an expiring token (the "transient blip" case - see README "Known
-    limitation") or surface its own sign-in UI for whoever's at the machine to complete. Neither
-    outcome is guaranteed - no script can complete an MFA challenge on a person's behalf - so
-    this never raises; callers re-check the returned connection mode themselves."""
-    try:
-        namespace.Logon("", "", True, False)
-    except Exception:  # noqa: BLE001
-        logger.debug("Namespace.Logon reconnect nudge failed (often harmless if already logged on).", exc_info=True)
-    try:
-        namespace.SendAndReceive(True)
-    except Exception:  # noqa: BLE001
-        logger.debug("SendAndReceive reconnect nudge failed.", exc_info=True)
-
-    deadline = time.monotonic() + wait_seconds
-    connection_mode = _read_exchange_connection_mode(namespace)
-    while (
-        connection_mode is not None
-        and _exchange_connection_problem(connection_mode) is not None
-        and time.monotonic() < deadline
-    ):
-        time.sleep(2)
-        connection_mode = _read_exchange_connection_mode(namespace)
-    return connection_mode
-
-
-def _send_via_outlook(subject: str, html_body: str, cfg: Config, attachments: list[Path]) -> None:
-    import win32com.client  # noqa: PLC0415
-
-    outlook = win32com.client.Dispatch("Outlook.Application")
-    namespace = outlook.GetNamespace("MAPI")
-    if cfg.email.outlook_profile:
-        namespace.Logon(cfg.email.outlook_profile)
-
-    connection_mode = _read_exchange_connection_mode(namespace)
-    problem = _exchange_connection_problem(connection_mode) if connection_mode is not None else None
-    if problem:
-        logger.warning(
-            "ExchangeConnectionMode=%s (%s) before sending '%s' - attempting a reconnect nudge "
-            "(Logon + forced Send/Receive) before giving up.",
-            connection_mode, problem, subject,
-        )
-        connection_mode = _attempt_reconnect(namespace, cfg.email.send_confirm_timeout_seconds)
-        problem = _exchange_connection_problem(connection_mode) if connection_mode is not None else None
-
-    if problem:
-        diagnosis = (
-            f"Outlook is not connected to Exchange - cannot send '{subject}'. "
-            f"ExchangeConnectionMode={connection_mode} ({problem}). A reconnect nudge (forced "
-            "Send/Receive) didn't clear it - sign in / reconnect Outlook (Send/Receive tab, or "
-            "close and reopen it) and re-run."
-        )
-        _alert_via_event_log(diagnosis)
-        raise RuntimeError(diagnosis)
-
-    outbox = namespace.GetDefaultFolder(_OUTLOOK_FOLDER_OUTBOX)
-    _cleanup_stale_outbox_items(outbox, cfg.email.stale_outbox_cleanup_seconds)
-    inbox_before = _inbox_last_received(namespace)
-
-    mail = outlook.CreateItem(0)  # olMailItem
-    mail.To = "; ".join(cfg.email.to)
-    if cfg.email.cc:
-        mail.CC = "; ".join(cfg.email.cc)
-    mail.Subject = subject
-    mail.HTMLBody = html_body
-    for attachment_path in attachments:
-        if attachment_path.exists():
-            mail.Attachments.Add(str(attachment_path))
-
-    # mail.Send() only queues the item into the local Outbox - it does not confirm the message
-    # was actually transmitted, and doesn't raise if Outlook's connection to Exchange has
-    # silently gone stale. Snapshot the Outbox's EntryIDs before/after Send() to identify the
-    # freshly-queued copy (subject text alone isn't reliable - stale stuck items from past runs
-    # can share the same subject), then poll for it to actually leave.
-    entry_ids_before = _outbox_entry_ids(outbox)
-    mail.Send()
-    new_entry_ids = _outbox_entry_ids(outbox) - entry_ids_before
-
-    if not new_entry_ids:
-        logger.info("Confirmed '%s' left the Outbox immediately (transmitted) to %s", subject, cfg.email.to)
-        return
-
-    if _confirm_outbox_transmit(namespace, outbox, subject, new_entry_ids, cfg):
-        return
-
-    total_attempts = cfg.email.send_confirm_retries + 1
-    inbox_after = _inbox_last_received(namespace)
-    connection_mode_after = _read_exchange_connection_mode(namespace)
-    if connection_mode_after is None:
-        mode_str = "unknown"
-        problem_after = "could not be determined - reading ExchangeConnectionMode failed"
-    else:
-        mode_str = str(connection_mode_after)
-        problem_after = _exchange_connection_problem(connection_mode_after) or "reports connected"
-    diagnosis = (
-        f"Email '{subject}' is still sitting in the Outbox after {total_attempts} attempt(s) of "
-        f"{cfg.email.send_confirm_timeout_seconds:.0f}s each - Outlook accepted it but never "
-        f"transmitted it. ExchangeConnectionMode={mode_str} ({problem_after}). Last Inbox mail "
-        f"received at {inbox_after} (was {inbox_before} before this send attempt) - if that "
-        "hasn't advanced, Outlook is not actually syncing with Exchange despite not reporting "
-        "itself offline; an interactive re-sign-in is required."
-    )
-    _alert_via_event_log(diagnosis)
-    raise RuntimeError(diagnosis)
-
-
-def _confirm_outbox_transmit(namespace, outbox, subject: str, new_entry_ids: set[str], cfg: Config) -> bool:
-    """Polls for new_entry_ids to leave the Outbox, retrying the wait (never a second Send() -
-    so there's no risk of a duplicate email) up to cfg.email.send_confirm_retries extra times if
-    it's still stuck. A transient Exchange blip can self-recover within seconds - observed
-    2026-09-09: a failure-alert for this exact timeout transmitted instantly moments later - so
-    it's worth riding out a couple of retries before giving up and alerting."""
-    attempts = cfg.email.send_confirm_retries + 1
-    for attempt in range(1, attempts + 1):
-        namespace.SendAndReceive(False)  # force transmission now rather than waiting on Outlook's timer
-        deadline = time.monotonic() + cfg.email.send_confirm_timeout_seconds
-        while time.monotonic() < deadline:
-            still_stuck = new_entry_ids & _outbox_entry_ids(outbox)
-            if not still_stuck:
-                logger.info(
-                    "Confirmed '%s' left the Outbox (transmitted) to %s%s",
-                    subject, cfg.email.to, f" on attempt {attempt}/{attempts}" if attempt > 1 else "",
-                )
-                return True
-            time.sleep(2)
-        if attempt < attempts:
+    kept: list[Path] = []
+    total_bytes = 0
+    for p in sorted(existing, key=priority):
+        size = p.stat().st_size
+        if kept and total_bytes + size > max_bytes:
             logger.warning(
-                "'%s' still in Outbox after %.0fs (attempt %d/%d) - retrying the wait rather than "
-                "giving up immediately.",
-                subject, cfg.email.send_confirm_timeout_seconds, attempt, attempts,
+                "Dropping attachment %s (%d bytes) - combined attachment size would exceed "
+                "graph.max_inline_attachment_bytes (%d).",
+                p.name, size, max_bytes,
             )
-    return False
+            continue
+        kept.append(p)
+        total_bytes += size
+
+    kept_names = {p.name for p in kept}
+    return [p for p in attachments if p.name in kept_names]
+
+
+def _build_attachment_payloads(attachment_paths: list[Path]) -> list[dict]:
+    payloads = []
+    for path in attachment_paths:
+        content_type, _ = mimetypes.guess_type(path.name)
+        payloads.append({
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": path.name,
+            "contentType": content_type or "application/octet-stream",
+            "contentBytes": base64.b64encode(path.read_bytes()).decode("ascii"),
+        })
+    return payloads
+
+
+def _send_via_graph(subject: str, html_body: str, cfg: Config, attachments: list[Path]) -> None:
+    attachment_paths = _prioritized_attachments(attachments, cfg.graph.max_inline_attachment_bytes)
+
+    message = {
+        "subject": subject,
+        "body": {"contentType": "HTML", "content": html_body},
+        "toRecipients": [{"emailAddress": {"address": addr}} for addr in cfg.email.to],
+        "attachments": _build_attachment_payloads(attachment_paths),
+    }
+    if cfg.email.cc:
+        message["ccRecipients"] = [{"emailAddress": {"address": addr}} for addr in cfg.email.cc]
+
+    try:
+        graph_client.graph_post(
+            f"/users/{cfg.graph.mailbox}/sendMail", cfg,
+            json_body={"message": message, "saveToSentItems": True},
+        )
+    except (graph_client.GraphApiError, graph_client.GraphAuthError) as exc:
+        diagnosis = f"Microsoft Graph could not send '{subject}': {exc}"
+        _alert_via_event_log(diagnosis)
+        raise
+
+    logger.info("Sent '%s' via Microsoft Graph to %s", subject, cfg.email.to)
 
 
 def send_success_email(summary_df: pd.DataFrame, detail_df: pd.DataFrame, cfg: Config,
@@ -422,7 +255,7 @@ def send_success_email(summary_df: pd.DataFrame, detail_df: pd.DataFrame, cfg: C
         )
         return
 
-    _send_via_outlook(subject, html, cfg, attachments)
+    _send_via_graph(subject, html, cfg, attachments)
 
 
 def send_failure_email(stage: str, exception: Exception, cfg: Config, run_date: date,
@@ -440,16 +273,17 @@ def send_failure_email(stage: str, exception: Exception, cfg: Config, run_date: 
         return
 
     try:
-        _send_via_outlook(subject, html, cfg, attachments=[log_path])
+        _send_via_graph(subject, html, cfg, attachments=[log_path])
     except Exception:  # noqa: BLE001
         logger.exception(
-            "Could not send failure email via Outlook COM (Outlook may be unreachable). "
-            "Failure details are in the run log at %s.",
+            "Could not send failure email via Microsoft Graph (Graph may be unreachable, or the "
+            "app registration/credentials may be invalid). Failure details are in the run log "
+            "at %s.",
             log_path,
         )
         teams_message = (
             f"Stage: {stage}\nError: {type(exception).__name__}: {exception}\n"
-            f"Outlook could not send either the original alert or this failure notification - "
-            f"see {log_path} for full details."
+            f"Microsoft Graph could not send either the original alert or this failure "
+            f"notification - see {log_path} for full details."
         )
         notify_teams.send_teams_alert(subject, teams_message, cfg)
